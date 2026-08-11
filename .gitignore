@@ -1,0 +1,7 @@
+.secrets/
+.DS_Store
+server/
+
+# Local test and editor artifacts
+*.swp
+*.tmp
