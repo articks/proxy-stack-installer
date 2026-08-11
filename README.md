@@ -125,6 +125,9 @@ sudo bash install-proxy-stack.sh d1.example.com d2.example.com
 
 При наличии второго домена подписка содержит два VLESS-узла: IPv4 и IPv6.
 
+Установщик создаёт один файл подписки с одним идентификатором. Он не добавляет
+старые Reality/TUN-профили и не объединяет найденные на сервере подписки.
+
 Не включайте одновременно встроенный MTProto/SOCKS5-прокси Telegram и системный прокси Happ: двойное проксирование может вызвать лавину повторных соединений.
 
 ## Повторный запуск
@@ -143,12 +146,67 @@ sudo bash install-proxy-stack.sh d1.example.com d2.example.com
 /root/proxy-stack-backup-YYYYMMDD-HHMMSS
 ```
 
+## Восстановление файла доступов
+
+Если `/root/proxy-credentials.txt` был случайно удалён, восстановите его без
+переустановки сервисов:
+
+```bash
+cd proxy-stack-installer
+sudo bash rebuild-proxy-credentials.sh
+```
+
+На сервере, установленном через `install-proxy-stack.sh`, утилита читает
+`/etc/proxy-stack/credentials.env` и сохраняет действующие MTProto-секреты,
+SOCKS5-пароль, VLESS UUID, WebSocket-путь и идентификатор Happ-подписки. По
+умолчанию она ничего не ротирует и не перезапускает.
+
+Показать восстановленный файл сразу после создания:
+
+```bash
+sudo bash rebuild-proxy-credentials.sh --print
+```
+
+Для старой или вручную собранной конфигурации, у которой нет постоянного файла
+состояния, укажите домены:
+
+```bash
+sudo bash rebuild-proxy-credentials.sh \
+  --domain d1.example.com \
+  --ipv6-domain d2.example.com
+```
+
+Если в `/var/www/faketls/happ` осталось несколько файлов подписок, утилита не
+объединяет их автоматически. Укажите идентификатор единственной рабочей
+подписки — имя файла без `.txt`:
+
+```bash
+sudo bash rebuild-proxy-credentials.sh \
+  --domain d1.example.com \
+  --subscription-id 0123456789abcdef0123456789abcdef
+```
+
+На старом сервере SOCKS5-пароль можно сохранить только при наличии прежнего
+`/root/proxy-credentials.txt`. Если открытый пароль утрачен, его невозможно
+получить из `/etc/shadow`; выполните явную ротацию:
+
+```bash
+sudo bash rebuild-proxy-credentials.sh \
+  --domain d1.example.com \
+  --rotate-socks-password
+```
+
+После ротации обновите SOCKS5-пароль во всех клиентах. Новый пароль будет
+записан в `/root/proxy-credentials.txt`, а на установке, управляемой этим
+проектом, также в `/etc/proxy-stack/credentials.env`.
+
 ## Основные файлы на сервере
 
 | Файл | Назначение |
 |---|---|
 | `/root/proxy-credentials.txt` | Клиентские конфигурации и секреты |
 | `/etc/proxy-stack/credentials.env` | Постоянное состояние установщика |
+| `rebuild-proxy-credentials.sh` | Безопасное пересоздание файла клиентских доступов |
 | `/etc/mtproxy/teleproxy.toml` | Настройки MTProto FakeTLS |
 | `/etc/danted.conf` | Настройки SOCKS5 |
 | `/usr/local/etc/xray/config.json` | Настройки VLESS/Xray |
@@ -210,7 +268,7 @@ systemctl list-timers mtproxy-config-refresh.timer
 ## Проверка установщика перед публикацией
 
 ```bash
-bash -n install-proxy-stack.sh
+bash -n install-proxy-stack.sh rebuild-proxy-credentials.sh
 ```
 
 Версии сторонних компонентов и их контрольные суммы закреплены непосредственно в начале скрипта.
