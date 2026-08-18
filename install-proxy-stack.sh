@@ -704,7 +704,7 @@ external: ${external_interface}
 clientmethod: none
 socksmethod: username
 
-user.privileged: proxy
+user.privileged: root
 user.unprivileged: nobody
 user.libwrap: nobody
 
@@ -919,7 +919,7 @@ After=network-online.target
 Type=simple
 EnvironmentFile=${STATE_DIR}/services.env
 WorkingDirectory=${MTPROXY_DIR}
-ExecStart=${MTPROXY_BIN} -u nobody -p 8889 -H 8443 -S \${RAW_SECRET} --aes-pwd ${MTPROXY_DIR}/proxy-secret ${MTPROXY_DIR}/proxy-multi.conf -M 1
+ExecStart=${MTPROXY_BIN} -u nobody -p 8889 -H 8443 -S \${RAW_SECRET} --http-stats --aes-pwd ${MTPROXY_DIR}/proxy-secret ${MTPROXY_DIR}/proxy-multi.conf -M 1
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
