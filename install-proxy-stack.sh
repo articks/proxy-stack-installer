@@ -2,6 +2,7 @@
 #
 # Deploy on a clean Ubuntu/Debian VPS:
 #   - Fake-TLS MTProto on TCP/443 (Teleproxy + a real nginx TLS backend)
+#   - Telegram WEB Proxy over HTTPS/443 (tproxy-server behind nginx)
 #   - legacy random-padding MTProto on TCP/8443 (official Telegram MTProxy)
 #   - authenticated SOCKS5 on TCP/1080 (Dante, TCP CONNECT only)
 #   - VLESS over WebSocket + TLS on TCP/9443 (Xray behind nginx)
@@ -23,6 +24,10 @@ umask 077
 readonly TELEPROXY_VERSION="4.16.1"
 readonly TELEPROXY_SHA256_AMD64="6afbc40af530e61e4b6275f630dde947f29e84b6e72b22a43a83f5f5ce36d340"
 readonly MTPROXY_COMMIT="f36d8af769ffaeac36978d38c2c0f6d1104c2137"
+readonly TPROXY_SERVER_COMMIT="f7a6acc4d536a787d442fd7df3ba4ebfd728f406"
+readonly TPROXY_SERVER_SHA256_AMD64="9a235e27e43881f3186004143452d3145175b975195661bba38a3ced2ea5571e"
+readonly GO_VERSION="1.26.5"
+readonly GO_SHA256_AMD64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
 readonly XRAY_VERSION="26.3.27"
 readonly XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
 
@@ -33,6 +38,10 @@ readonly CREDENTIALS_OUTPUT="/root/proxy-credentials.txt"
 readonly MTPROXY_DIR="/etc/mtproxy"
 readonly TELEPROXY_BIN="/usr/local/bin/teleproxy"
 readonly MTPROXY_BIN="/usr/local/bin/mtproto-proxy"
+readonly TPROXY_SERVER_BIN="/usr/local/bin/tproxy-server"
+readonly TPROXY_SERVER_DIR="/etc/tproxy-server"
+readonly TPROXY_SERVER_CONFIG="${TPROXY_SERVER_DIR}/config.json"
+readonly TPROXY_SERVER_PROFILES="${TPROXY_SERVER_DIR}/profiles.json"
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly XRAY_CONFIG_DIR="/usr/local/etc/xray"
 readonly XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
@@ -54,6 +63,7 @@ VLESS_UUID=""
 VLESS_WS_PATH=""
 HAPP_SUBSCRIPTION_ID=""
 XRAY_TEST_PID=""
+GO_BIN=""
 
 log() {
   printf '\n[proxy-stack] %s\n' "$*"
@@ -82,7 +92,7 @@ on_error() {
   local exit_code=$?
   local line_no=$1
   printf '\n[proxy-stack] Installation failed at line %s (exit %s).\n' "${line_no}" "${exit_code}" >&2
-  printf '[proxy-stack] Inspect logs with: journalctl -u teleproxy -u mtproxy -u danted -u xray -u nginx --no-pager -n 150\n' >&2
+  printf '[proxy-stack] Inspect logs with: journalctl -u teleproxy -u tproxy-server -u mtproxy -u danted -u xray -u nginx --no-pager -n 150\n' >&2
   exit "${exit_code}"
 }
 
@@ -176,10 +186,10 @@ check_clean_ports() {
   local port
 
   if [[ -f "${STATE_FILE}" ]]; then
-    systemctl stop teleproxy.service mtproxy-ipv6.service mtproxy.service danted.service xray.service 2>/dev/null || true
+    systemctl stop teleproxy.service tproxy-server.service mtproxy-ipv6.service mtproxy.service danted.service xray.service 2>/dev/null || true
   fi
 
-  for port in 443 8443 9443 1080 8444 8888 8889 10000; do
+  for port in 443 8443 9443 1080 8080 8081 8444 8888 8889 10000; do
     if [[ ("${port}" == "8444" || "${port}" == "9443") && -f "${STATE_FILE}" && -f "${NGINX_SITE}" ]] && \
       systemctl is-active --quiet nginx.service; then
       continue
@@ -197,28 +207,44 @@ check_clean_ports() {
 }
 
 install_packages() {
-  log "Installing operating-system packages"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
-    certbot \
-    curl \
-    dante-server \
-    dnsutils \
-    git \
-    iproute2 \
-    jq \
-    libssl-dev \
-    nginx \
-    openssl \
-    python3 \
-    socat \
-    ufw \
-    unzip \
-    xxd \
+  local package
+  local -a missing_packages=()
+  local -a required_packages=(
+    build-essential
+    ca-certificates
+    certbot
+    curl
+    dante-server
+    dnsutils
+    git
+    iproute2
+    jq
+    libssl-dev
+    nginx
+    openssl
+    python3
+    socat
+    tar
+    ufw
+    unzip
+    xxd
     zlib1g-dev
+  )
+
+  log "Installing operating-system packages"
+  for package in "${required_packages[@]}"; do
+    if [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null || true)" != "ii " ]]; then
+      missing_packages+=("${package}")
+    fi
+  done
+
+  if ((${#missing_packages[@]})); then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends "${missing_packages[@]}"
+  else
+    log "All required operating-system packages are already installed"
+  fi
 
   systemctl stop danted.service 2>/dev/null || true
 }
@@ -390,6 +416,60 @@ install_official_mtproxy() {
   printf '%s\n' "${MTPROXY_COMMIT}" | write_atomic 0600 "${STATE_DIR}/mtproxy.commit"
 }
 
+select_go_toolchain() {
+  local go_minor=""
+  local go_archive="${WORK_DIR}/go${GO_VERSION}.linux-amd64.tar.gz"
+  local go_root="/opt/go${GO_VERSION}"
+
+  if command -v go >/dev/null 2>&1; then
+    go_minor="$(go env GOVERSION 2>/dev/null | sed -E 's/^go1\.([0-9]+).*/\1/')"
+    if [[ "${go_minor}" =~ ^[0-9]+$ ]] && ((go_minor >= 20)); then
+      GO_BIN="$(command -v go)"
+      return
+    fi
+  fi
+
+  if [[ ! -x "${go_root}/bin/go" ]]; then
+    log "Installing Go ${GO_VERSION} for Telegram WEB Proxy"
+    curl -fL --retry 4 --retry-all-errors --connect-timeout 15 --max-time 180 \
+      "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o "${go_archive}"
+    printf '%s  %s\n' "${GO_SHA256_AMD64}" "${go_archive}" | sha256sum --check --status
+    install -d -o root -g root -m 0755 "${go_root}"
+    tar -C "${go_root}" --strip-components=1 -xzf "${go_archive}"
+  fi
+
+  GO_BIN="${go_root}/bin/go"
+}
+
+install_tproxy_server() {
+  local archive="${WORK_DIR}/tproxy-server.tar.gz"
+  local source_dir="${WORK_DIR}/tproxy-server-${TPROXY_SERVER_COMMIT}"
+
+  if [[ -x "${TPROXY_SERVER_BIN}" && -f "${STATE_DIR}/tproxy-server.commit" ]] && \
+    [[ "$(<"${STATE_DIR}/tproxy-server.commit")" == "${TPROXY_SERVER_COMMIT}" ]]; then
+    log "Telegram WEB Proxy relay ${TPROXY_SERVER_COMMIT:0:12} is already installed"
+    return
+  fi
+
+  select_go_toolchain
+  log "Building Telegram WEB Proxy relay at pinned commit ${TPROXY_SERVER_COMMIT:0:12}"
+  curl -fL --retry 4 --retry-all-errors --connect-timeout 15 --max-time 180 \
+    "https://github.com/telegramdesktop/tproxy-server/archive/${TPROXY_SERVER_COMMIT}.tar.gz" \
+    -o "${archive}"
+  printf '%s  %s\n' "${TPROXY_SERVER_SHA256_AMD64}" "${archive}" | sha256sum --check --status
+  tar -C "${WORK_DIR}" -xzf "${archive}"
+  [[ -f "${source_dir}/go.mod" ]] || die "The Telegram WEB Proxy source archive is incomplete."
+
+  # Upstream has a permission test that intentionally creates a 0444 file.
+  # The installer's protective 0077 umask would silently turn it into 0400
+  # and invalidate the test fixture, so run only the test subprocess at 0022.
+  (umask 0022; cd "${source_dir}" && "${GO_BIN}" test ./...)
+  (cd "${source_dir}" && CGO_ENABLED=0 "${GO_BIN}" build -trimpath -ldflags='-s -w' \
+    -o "${WORK_DIR}/tproxy-server" ./cmd/tproxy-server)
+  install -o root -g root -m 0755 "${WORK_DIR}/tproxy-server" "${TPROXY_SERVER_BIN}"
+  printf '%s\n' "${TPROXY_SERVER_COMMIT}" | write_atomic 0600 "${STATE_DIR}/tproxy-server.commit"
+}
+
 install_xray() {
   local archive="${WORK_DIR}/Xray-linux-64.zip"
   local extract_dir="${WORK_DIR}/xray-release"
@@ -525,6 +605,11 @@ configure_nginx_and_certificate() {
   install -d -o www-data -g www-data -m 0755 "${NGINX_ROOT}/.well-known/acme-challenge"
 
   write_atomic 0644 "${NGINX_SITE}" <<EOF
+map \$http_upgrade \$proxy_stack_connection {
+    default upgrade;
+    ''      '';
+}
+
 server {
     listen 80;
 ${nginx_http_ipv6}
@@ -581,6 +666,11 @@ EOF
 EOF
 
   write_atomic 0644 "${NGINX_SITE}" <<EOF
+map \$http_upgrade \$proxy_stack_connection {
+    default upgrade;
+    ''      '';
+}
+
 server {
     listen 80;
 ${nginx_http_ipv6}
@@ -597,22 +687,31 @@ ${nginx_http_ipv6}
 }
 
 server {
-    listen 127.0.0.1:8444 ssl default_server;
+    listen 127.0.0.1:8444 ssl http2 default_server;
     server_name ${server_names};
     server_tokens off;
+    access_log off;
+    client_max_body_size 2m;
 
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-    ssl_protocols TLSv1.3;
+    ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers off;
     ssl_ecdh_curve X25519:prime256v1;
     ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256;
 
-    root ${NGINX_ROOT};
-    index index.html;
-
     location / {
-        try_files \$uri \$uri/ =404;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$proxy_stack_connection;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
     }
 }
 
@@ -829,6 +928,97 @@ WantedBy=multi-user.target
 EOF
 }
 
+configure_tproxy_server() {
+  local token_key="${TPROXY_SERVER_DIR}/token.key"
+  local temporary_key="${WORK_DIR}/tproxy-token.key"
+
+  log "Configuring Telegram WEB Proxy relay"
+  if ! id tproxy >/dev/null 2>&1; then
+    useradd --system --home /nonexistent --shell /usr/sbin/nologin tproxy
+  fi
+  install -d -o root -g tproxy -m 0750 "${TPROXY_SERVER_DIR}"
+
+  if [[ -L "${token_key}" ]] || { [[ -e "${token_key}" ]] && [[ ! -f "${token_key}" ]]; }; then
+    die "Telegram WEB Proxy token key must be a regular file: ${token_key}"
+  fi
+  if [[ ! -e "${token_key}" ]]; then
+    openssl rand 32 >"${temporary_key}"
+    install -o tproxy -g tproxy -m 0400 "${temporary_key}" "${token_key}"
+  fi
+  [[ "$(wc -c <"${token_key}")" -eq 32 ]] || \
+    die "Telegram WEB Proxy token key must contain exactly 32 bytes."
+  chown tproxy:tproxy "${token_key}"
+  chmod 0400 "${token_key}"
+
+  write_atomic 0640 "${TPROXY_SERVER_CONFIG}" <<EOF
+{
+  "public_hostname": "${DOMAIN}",
+  "listen": "127.0.0.1:8080",
+  "admin_listen": "127.0.0.1:8081",
+  "public_dir": "${NGINX_ROOT}",
+  "static_routes": "exact",
+  "token_key_file": "${token_key}",
+  "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
+}
+EOF
+  chown root:tproxy "${TPROXY_SERVER_CONFIG}"
+
+  write_atomic 0400 "${TPROXY_SERVER_PROFILES}" <<EOF
+{"profiles":[{"name":"default","secret":"dd${RAW_SECRET}","backend":"127.0.0.1:8443","carrier_mode":"websocket"}]}
+EOF
+  chown root:tproxy "${TPROXY_SERVER_PROFILES}"
+
+  "${TPROXY_SERVER_BIN}" -config "${TPROXY_SERVER_CONFIG}" \
+    -profiles-file "${TPROXY_SERVER_PROFILES}" -check
+
+  write_atomic 0644 "/etc/systemd/system/tproxy-server.service" <<EOF
+[Unit]
+Description=Telegram WEB Proxy HTTPS transport relay
+After=network-online.target mtproxy.service
+Wants=network-online.target mtproxy.service
+
+[Service]
+Type=simple
+User=tproxy
+Group=tproxy
+LoadCredential=profiles.json:${TPROXY_SERVER_PROFILES}
+ExecStart=${TPROXY_SERVER_BIN} -config ${TPROXY_SERVER_CONFIG}
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+ReadOnlyPaths=-${NGINX_ROOT}
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 write_happ_subscription() {
   local subscription_dir="${NGINX_ROOT}/happ"
   local subscription_file="${subscription_dir}/${HAPP_SUBSCRIPTION_ID}.txt"
@@ -966,7 +1156,7 @@ EOF
   fi
 
   systemctl daemon-reload
-  systemctl enable mtproxy-config-refresh.timer mtproxy.service teleproxy.service danted.service xray.service
+  systemctl enable mtproxy-config-refresh.timer mtproxy.service teleproxy.service tproxy-server.service danted.service xray.service
   if ((ENABLE_IPV6)); then
     systemctl enable mtproxy-ipv6.service
   fi
@@ -974,6 +1164,7 @@ EOF
   systemctl restart danted.service
   systemctl restart xray.service
   systemctl restart mtproxy.service
+  systemctl restart tproxy-server.service
   if ((ENABLE_IPV6)); then
     systemctl restart mtproxy-ipv6.service
   fi
@@ -994,6 +1185,60 @@ retry() {
     sleep "${delay}"
   done
   return 1
+}
+
+web_proxy_capability() {
+  printf 'tdesktop-web-proxy-bridge-v1\n%s' "${DOMAIN}" | \
+    openssl dgst -sha256 -mac HMAC -macopt "hexkey:dd${RAW_SECRET}" -binary | \
+    openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+verify_web_proxy_endpoint() {
+  local bridge_capability
+  local bootstrap_token
+  local session_token
+  local http_code
+  local bridge_page="${WORK_DIR}/web-proxy-bridge.html"
+  local hello_frame="${WORK_DIR}/web-proxy-hello.bin"
+  local welcome_frame="${WORK_DIR}/web-proxy-welcome.bin"
+  local session_headers="${WORK_DIR}/web-proxy-session.headers"
+  local websocket_headers="${WORK_DIR}/web-proxy-websocket.headers"
+
+  bridge_capability="$(web_proxy_capability)"
+  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" \
+    "https://${DOMAIN}/?bridge=${bridge_capability}" -o "${bridge_page}"
+  bootstrap_token="$(sed -n 's/.*bootstrap="\([A-Za-z0-9_-]\{43\}\)".*/\1/p' "${bridge_page}" | head -n 1)"
+  [[ "${bootstrap_token}" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
+    die "Telegram WEB Proxy bridge page did not contain a valid bootstrap token."
+
+  printf '100000000000000101' | xxd -r -p >"${hello_frame}"
+  http_code="$(curl -sS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" \
+    -D "${session_headers}" -o "${welcome_frame}" -w '%{http_code}' \
+    -H "Authorization: Bearer ${bootstrap_token}" \
+    -H 'Content-Type: application/octet-stream' \
+    --data-binary "@${hello_frame}" "https://${DOMAIN}/api/v1/session")"
+  [[ "${http_code}" == 200 && "$(xxd -p -c 256 "${welcome_frame}")" == 1100000000000000 ]] || \
+    die "Telegram WEB Proxy refused a carrier session."
+  awk 'BEGIN {IGNORECASE=1} {sub(/\r$/, "")} $0 == "X-Carrier-Mode: websocket" {found=1} END {exit !found}' \
+    "${session_headers}" || \
+    die "Telegram WEB Proxy returned an unexpected carrier mode."
+  session_token="$(awk 'BEGIN {IGNORECASE=1} /^X-Session-Token:/ {gsub(/\r/, ""); print $2; exit}' "${session_headers}")"
+  [[ "${session_token}" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
+    die "Telegram WEB Proxy did not return a valid session token."
+
+  curl -sS --http1.1 --max-time 2 --resolve "${DOMAIN}:443:127.0.0.1" \
+    -D "${websocket_headers}" -o /dev/null \
+    -H 'Connection: Upgrade' \
+    -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' \
+    -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    -H "Origin: https://${DOMAIN}" \
+    -H "Sec-WebSocket-Protocol: tproxy-v1.${session_token}" \
+    "https://${DOMAIN}/api/v1/ws" 2>/dev/null || true
+  grep -Eq '^HTTP/1\.[01] 101([[:space:]]|$)' "${websocket_headers}" || \
+    die "Telegram WEB Proxy WebSocket upgrade failed."
+  grep -Fqi "Sec-WebSocket-Protocol: tproxy-v1.${session_token}" "${websocket_headers}" || \
+    die "Telegram WEB Proxy WebSocket subprotocol was not accepted."
 }
 
 verify_vless_endpoint() {
@@ -1099,6 +1344,7 @@ verify_services() {
     danted.service
     xray.service
     mtproxy.service
+    tproxy-server.service
     teleproxy.service
     mtproxy-config-refresh.timer
   )
@@ -1117,9 +1363,15 @@ verify_services() {
 
   retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8888/stats >/dev/null
   retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8889/stats >/dev/null
+  retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8081/healthz >/dev/null
+  retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8081/readyz >/dev/null
   retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" >/dev/null
+  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" \
+    "https://${DOMAIN}/happ/${HAPP_SUBSCRIPTION_ID}.txt" >/dev/null
   retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:9443:127.0.0.1" \
     "https://${DOMAIN}:9443/happ/${HAPP_SUBSCRIPTION_ID}.txt" >/dev/null
+
+  verify_web_proxy_endpoint
 
   socks_result="$(curl -4fsS --connect-timeout 10 --max-time 30 \
     --proxy "socks5h://${SOCKS_USER}:${SOCKS_PASSWORD}@127.0.0.1:1080" \
@@ -1247,6 +1499,13 @@ Server: ${DOMAIN}
 Port: 8443
 Secret: ${legacy_secret}
 
+Telegram WEB Proxy (experimental)
+Type: WEB Proxy
+Hostname: ${DOMAIN}
+Port: 443 (fixed by the protocol)
+Secret: ${legacy_secret}
+Link: tg://webproxy?server=${DOMAIN}&secret=${legacy_secret}
+
 SOCKS5
 Type: SOCKS5
 Server: ${DOMAIN}
@@ -1303,11 +1562,13 @@ ${ipv6_output}
 ADMINISTRATION
 Credentials file: ${CREDENTIALS_OUTPUT}
 Xray config: ${XRAY_CONFIG}
+Telegram WEB Proxy config: ${TPROXY_SERVER_CONFIG}
 Happ subscription file: ${NGINX_ROOT}/happ/${HAPP_SUBSCRIPTION_ID}.txt
 FakeTLS stats: curl http://127.0.0.1:8888/stats
 Legacy stats: curl http://127.0.0.1:8889/stats
+WEB Proxy health: curl http://127.0.0.1:8081/readyz
 Refresh timer: systemctl list-timers mtproxy-config-refresh.timer
-Logs: journalctl -u teleproxy -u mtproxy -u danted -u xray -u nginx --no-pager -n 150
+Logs: journalctl -u teleproxy -u tproxy-server -u mtproxy -u danted -u xray -u nginx --no-pager -n 150
 
 Security note: ordinary SOCKS5 is authenticated but not itself encrypted.
 EOF
@@ -1352,6 +1613,8 @@ main() {
   backup_if_present "/etc/systemd/system/teleproxy.service" "${backup_dir}"
   backup_if_present "/etc/systemd/system/mtproxy.service" "${backup_dir}"
   backup_if_present "/etc/systemd/system/mtproxy-ipv6.service" "${backup_dir}"
+  backup_if_present "/etc/systemd/system/tproxy-server.service" "${backup_dir}"
+  backup_if_present "${TPROXY_SERVER_DIR}" "${backup_dir}"
   backup_if_present "/etc/systemd/system/xray.service" "${backup_dir}"
   backup_if_present "${XRAY_CONFIG}" "${backup_dir}"
 
@@ -1362,12 +1625,14 @@ main() {
   load_or_create_credentials
   install_teleproxy
   install_official_mtproxy
+  install_tproxy_server
   install_xray
   install_refresh_timer
   configure_firewall
   configure_nginx_and_certificate
   configure_dante
   configure_xray
+  configure_tproxy_server
   write_happ_subscription
   install_proxy_services
   verify_services

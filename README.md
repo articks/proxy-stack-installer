@@ -2,7 +2,7 @@
 
 Автоматическая установка собственного прокси-стека на чистый VPS с Ubuntu или Debian.
 
-Один Bash-скрипт разворачивает два варианта MTProto, SOCKS5 и VLESS WebSocket+TLS. IPv6 включается только при передаче отдельного IPv6-домена.
+Один Bash-скрипт разворачивает два варианта MTProto, экспериментальный Telegram WEB Proxy, SOCKS5 и VLESS WebSocket+TLS. IPv6 включается только при передаче отдельного IPv6-домена.
 
 > Используйте проект только на серверах, которыми вы имеете право управлять, и соблюдайте применимое законодательство и правила хостинг-провайдера.
 
@@ -11,6 +11,7 @@
 | Сервис | Порт | IPv4 | IPv6 | Назначение |
 |---|---:|:---:|:---:|---|
 | MTProto FakeTLS (Teleproxy) | TCP/443 | Да | Опционально | Основной прокси Telegram |
+| Telegram WEB Proxy | HTTPS/443 | Да | Нет | WebView-транспорт через `tproxy-server` |
 | MTProto legacy random padding | TCP/8443 | Да | Опционально | Резервный прокси Telegram |
 | SOCKS5 с логином и паролем | TCP/1080 | Да | Опционально | Универсальный TCP-прокси |
 | VLESS WebSocket+TLS | TCP/9443 | Да | Опционально | Happ и другие VLESS-клиенты |
@@ -19,6 +20,7 @@
 Дополнительно устанавливаются:
 
 - nginx как TLS-терминатор и WebSocket reverse proxy;
+- официальный proof-of-concept `telegramdesktop/tproxy-server`, собранный из закреплённого коммита;
 - Xray с закреплённой версией и проверкой SHA-256;
 - UFW с открытием только необходимых публичных портов;
 - автоматическое продление сертификата;
@@ -30,7 +32,8 @@
 - чистый VPS на Ubuntu или Debian с `systemd`;
 - архитектура `x86_64`;
 - доступ `root` или `sudo`;
-- свободные TCP-порты `80`, `443`, `1080`, `8443` и `9443`;
+- свободные публичные TCP-порты `80`, `443`, `1080`, `8443` и `9443`;
+- свободные локальные TCP-порты `8080` и `8081` для WEB relay;
 - DNS-записи без Cloudflare/CDN-проксирования;
 - первый домен только для IPv4;
 - второй домен только для IPv6, если IPv6 нужен.
@@ -106,6 +109,7 @@ sudo bash install-proxy-stack.sh d1.example.com d2.example.com
 
 - MTProto FakeTLS через домен и IP;
 - MTProto legacy через домен и IP;
+- Telegram WEB Proxy через основной IPv4-домен;
 - SOCKS5 через домен и IP;
 - VLESS URI через домен и IP;
 - отдельные IPv6-конфигурации, если передан второй домен;
@@ -113,6 +117,28 @@ sudo bash install-proxy-stack.sh d1.example.com d2.example.com
 - команды диагностики.
 
 Показывайте файл только доверенным пользователям: в нём находятся все секреты доступа.
+
+## Telegram WEB Proxy
+
+WEB Proxy использует только имя хоста и MTProto-секрет. Внешний HTTPS-порт
+зафиксирован протоколом на `443`, поэтому произвольный публичный порт указать
+нельзя. Установщик сохраняет существующий MTProto FakeTLS на том же порту и
+добавляет отдельный relay на локальных адресах `127.0.0.1:8080` и
+`127.0.0.1:8081` по цепочке:
+
+```text
+Telegram -> HTTPS/443 -> Teleproxy -> nginx -> tproxy-server -> MTProxy
+```
+
+Готовые `Hostname`, `Secret` и `tg://webproxy`-ссылка записываются в
+`/root/proxy-credentials.txt`. WEB Proxy настраивается только для первого,
+IPv4-домена; подключение по IP не поддерживается из-за TLS и привязки
+производного bridge-ключа к имени хоста.
+
+На момент фиксации этой версии upstream называет реализацию
+[proof-of-concept](https://github.com/telegramdesktop/tproxy-server): Desktop-клиент
+реализован, Android экспериментален, а iOS описан как план. Обычные клиенты без
+пункта `WEB Proxy` этот вариант использовать не смогут.
 
 ## Happ
 
@@ -208,6 +234,8 @@ sudo bash rebuild-proxy-credentials.sh \
 | `/etc/proxy-stack/credentials.env` | Постоянное состояние установщика |
 | `rebuild-proxy-credentials.sh` | Безопасное пересоздание файла клиентских доступов |
 | `/etc/mtproxy/teleproxy.toml` | Настройки MTProto FakeTLS |
+| `/etc/tproxy-server/config.json` | Настройки Telegram WEB Proxy relay |
+| `/etc/tproxy-server/profiles.json` | Закрытый WEB-профиль и секрет |
 | `/etc/danted.conf` | Настройки SOCKS5 |
 | `/usr/local/etc/xray/config.json` | Настройки VLESS/Xray |
 | `/etc/nginx/sites-available/proxy-stack.conf` | HTTP, TLS и WebSocket reverse proxy |
@@ -217,7 +245,7 @@ sudo bash rebuild-proxy-credentials.sh \
 Состояние служб:
 
 ```bash
-systemctl status teleproxy mtproxy danted xray nginx
+systemctl status teleproxy tproxy-server mtproxy danted xray nginx
 ```
 
 Если включён IPv6:
@@ -229,7 +257,7 @@ systemctl status mtproxy-ipv6
 Последние сообщения журналов:
 
 ```bash
-journalctl -u teleproxy -u mtproxy -u danted -u xray -u nginx --no-pager -n 150
+journalctl -u teleproxy -u tproxy-server -u mtproxy -u danted -u xray -u nginx --no-pager -n 150
 ```
 
 Открытые порты:
@@ -244,6 +272,7 @@ ss -lntp
 nginx -t
 /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
 /usr/sbin/danted -V -f /etc/danted.conf
+curl --fail http://127.0.0.1:8081/readyz
 ```
 
 Таймер обновления Telegram relay-конфигурации:
@@ -257,6 +286,7 @@ systemctl list-timers mtproxy-config-refresh.timer
 - SOCKS5 требует логин и пароль, но сам протокол не шифрует соединение до VPS.
 - VLESS доступен через TLS с сертификатом Let's Encrypt.
 - Xray слушает только `127.0.0.1`; наружу публикуется nginx на `9443`.
+- Telegram WEB Proxy relay и его административный endpoint слушают только loopback; TLS обслуживает существующий nginx.
 - Случайные секреты, UUID и WebSocket-путь создаются индивидуально при установке.
 - Не публикуйте `/root/proxy-credentials.txt` и `/etc/proxy-stack/credentials.env`.
 - Регулярно обновляйте систему и следите за журналами необычных подключений.

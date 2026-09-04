@@ -20,6 +20,7 @@ umask 077
 readonly STATE_FILE="/etc/proxy-stack/credentials.env"
 readonly OUTPUT_FILE="/root/proxy-credentials.txt"
 readonly MTPROXY_ENV="/etc/mtproxy/mtproxy.env"
+readonly TPROXY_SERVER_CONFIG="/etc/tproxy-server/config.json"
 readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
 readonly HAPP_DIR="/var/www/faketls/happ"
 
@@ -294,6 +295,7 @@ write_credentials() {
   local legacy_secret
   local subscription_output
   local vless_output
+  local web_proxy_output=""
 
   domain_hex_ipv4="$(printf '%s' "${DOMAIN}" | xxd -p -c 256)"
   faketls_secret_ipv4="ee${RAW_SECRET}${domain_hex_ipv4}"
@@ -304,6 +306,22 @@ write_credentials() {
     vless_output="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-IPv4")"
   else
     vless_output="$(build_manual_vless_output)"
+  fi
+
+  if [[ -r "${TPROXY_SERVER_CONFIG}" && -r /etc/tproxy-server/profiles.json ]] && \
+    jq -e --arg domain "${DOMAIN}" '.public_hostname == $domain' "${TPROXY_SERVER_CONFIG}" >/dev/null && \
+    jq -e --arg secret "dd${RAW_SECRET}" \
+      '.profiles | any(.secret == $secret)' /etc/tproxy-server/profiles.json >/dev/null; then
+    web_proxy_output="$(cat <<EOF
+
+Telegram WEB Proxy (experimental)
+Type: WEB Proxy
+Hostname: ${DOMAIN}
+Port: 443 (fixed by the protocol)
+Secret: ${legacy_secret}
+Link: tg://webproxy?server=${DOMAIN}&secret=${legacy_secret}
+EOF
+)"
   fi
 
   TEMPORARY_OUTPUT="$(mktemp /root/.proxy-credentials.XXXXXX)"
@@ -325,6 +343,7 @@ Type: MTProto
 Server: ${DOMAIN}
 Port: 8443
 Secret: ${legacy_secret}
+${web_proxy_output}
 
 SOCKS5
 Type: SOCKS5
@@ -439,12 +458,13 @@ Credentials file: ${OUTPUT_FILE}
 Persistent installer state: ${STATE_FILE}
 MTProto state: ${MTPROXY_ENV}
 Teleproxy config: /etc/mtproxy/teleproxy.toml
+Telegram WEB Proxy config: ${TPROXY_SERVER_CONFIG}
 SOCKS5 config: /etc/danted.conf
 Xray config: ${XRAY_CONFIG}
 Happ subscription directory: ${HAPP_DIR}
 
 Refresh timer: systemctl list-timers mtproxy-config-refresh.timer
-Logs: journalctl -u teleproxy -u mtproxy -u mtproxy-ipv6 -u danted -u xray -u nginx --no-pager -n 150
+Logs: journalctl -u teleproxy -u tproxy-server -u mtproxy -u mtproxy-ipv6 -u danted -u xray -u nginx --no-pager -n 150
 
 SSH private keys are intentionally not stored in this file.
 Security note: ordinary SOCKS5 is authenticated but is not encrypted by itself.
