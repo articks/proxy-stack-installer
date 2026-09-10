@@ -132,7 +132,7 @@ vless_uri() {
   local title=$3
   local encoded_path="%2F${VLESS_WS_PATH#/}"
 
-  printf 'vless://%s@%s:9443?encryption=none&security=tls&sni=%s&fp=chrome&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
+  printf 'vless://%s@%s:9443?encryption=none&security=tls&sni=%s&fp=safari&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
     "${VLESS_UUID}" "${address}" "${tls_domain}" "${tls_domain}" "${encoded_path}" "${title}"
 }
 
