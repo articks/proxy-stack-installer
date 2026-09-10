@@ -130,10 +130,11 @@ vless_uri() {
   local address=$1
   local tls_domain=$2
   local title=$3
+  local port=${4:-443}
   local encoded_path="%2F${VLESS_WS_PATH#/}"
 
-  printf 'vless://%s@%s:9443?encryption=none&security=tls&sni=%s&fp=safari&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
-    "${VLESS_UUID}" "${address}" "${tls_domain}" "${tls_domain}" "${encoded_path}" "${title}"
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=safari&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
+    "${VLESS_UUID}" "${address}" "${port}" "${tls_domain}" "${tls_domain}" "${encoded_path}" "${title}"
 }
 
 update_managed_socks_password() {
@@ -281,7 +282,11 @@ build_manual_vless_output() {
   done < <(grep '^vless://' "${ACTIVE_SUBSCRIPTION_FILE}" || true)
 
   if [[ -z "${output}" && -n "${VLESS_WS_PATH}" ]]; then
-    output+="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-IPv4")\n\n"
+    output+="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")\n\n"
+  fi
+
+  if [[ -n "${VLESS_WS_PATH}" ]]; then
+    output+="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4" 9443)\n\n"
   fi
 
   printf '%b' "${output}"
@@ -303,7 +308,9 @@ write_credentials() {
   subscription_output="$(build_subscription_output)"
 
   if ((MANAGED_INSTALL)); then
-    vless_output="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-IPv4")"
+    vless_output="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")
+
+$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4" 9443)"
   else
     vless_output="$(build_manual_vless_output)"
   fi
@@ -358,7 +365,7 @@ socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${DOMAIN}:1080#SOCKS5-IPv4
 VLESS WebSocket + TLS
 Type: VLESS
 Server: ${DOMAIN}
-Port: 9443
+Ports: 443 (primary), 9443 (reserve)
 UUID: ${VLESS_UUID}
 Transport: WebSocket
 TLS/SNI/Host: ${DOMAIN}
@@ -390,6 +397,11 @@ Password: ${SOCKS_PASSWORD}
 
 Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${PUBLIC_IPV4}:1080#SOCKS5-IPv4-IP
+
+VLESS client URI(s):
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4-IP")
+
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4-IP" 9443)
 EOF
 
   if [[ -n "${DOMAIN_IPV6}" ]]; then
@@ -421,6 +433,11 @@ Password: ${SOCKS_PASSWORD}
 Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${DOMAIN_IPV6}:1080#SOCKS5-IPv6
 
+VLESS client URI(s):
+$(vless_uri "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6")
+
+$(vless_uri "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-9443-IPv6" 9443)
+
 VIA IPV6 ADDRESS
 
 MTProto FakeTLS (primary)
@@ -444,6 +461,11 @@ Password: ${SOCKS_PASSWORD}
 
 Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@[${PUBLIC_IPV6}]:1080#SOCKS5-IPv6-IP
+
+VLESS client URI(s):
+$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6-IP")
+
+$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-9443-IPv6-IP" 9443)
 EOF
   fi
 

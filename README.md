@@ -14,7 +14,7 @@
 | Telegram WEB Proxy | HTTPS/443 | Да | Нет | WebView-транспорт через `tproxy-server` |
 | MTProto legacy random padding | TCP/8443 | Да | Опционально | Резервный прокси Telegram |
 | SOCKS5 с логином и паролем | TCP/1080 | Да | Опционально | Универсальный TCP-прокси |
-| VLESS WebSocket+TLS | TCP/9443 | Да | Опционально | Happ и другие VLESS-клиенты |
+| VLESS WebSocket+TLS | TCP/443, TCP/9443 | Да | Опционально | Happ и другие VLESS-клиенты; `443` основной, `9443` резервный |
 | HTTP ACME challenge | TCP/80 | Да | Опционально | Выпуск и продление сертификата Let's Encrypt |
 
 Дополнительно устанавливаются:
@@ -152,6 +152,9 @@ IPv4-домена; подключение по IP не поддерживает�
 При наличии второго домена подписка содержит два VLESS-узла: IPv4 и IPv6.
 Узлы используют TLS fingerprint `safari`: он совместим с Xray в Happ на
 macOS/iOS и не вызывает зависание TLS ClientHello, наблюдаемое с `fp=chrome`.
+Основной VLESS-маршрут делит внешний `443` с MTProto и WEB Proxy: Teleproxy
+передаёт обычный TLS во внутренний nginx, а nginx выбирает Xray только по
+точному секретному WebSocket-пути. Порт `9443` остаётся доступным как резервный.
 
 Установщик создаёт один файл подписки с одним идентификатором. Он не добавляет
 старые Reality/TUN-профили и не объединяет найденные на сервере подписки.
@@ -287,7 +290,8 @@ systemctl list-timers mtproxy-config-refresh.timer
 
 - SOCKS5 требует логин и пароль, но сам протокол не шифрует соединение до VPS.
 - VLESS доступен через TLS с сертификатом Let's Encrypt.
-- Xray слушает только `127.0.0.1`; наружу публикуется nginx на `9443`.
+- Xray слушает только `127.0.0.1`; наружу VLESS публикуется через Teleproxy/nginx
+  на `443` и напрямую через nginx на резервном `9443`.
 - Telegram WEB Proxy relay и его административный endpoint слушают только loopback; TLS обслуживает существующий nginx.
 - Случайные секреты, UUID и WebSocket-путь создаются индивидуально при установке.
 - Не публикуйте `/root/proxy-credentials.txt` и `/etc/proxy-stack/credentials.env`.

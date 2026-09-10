@@ -5,7 +5,7 @@
 #   - Telegram WEB Proxy over HTTPS/443 (tproxy-server behind nginx)
 #   - legacy random-padding MTProto on TCP/8443 (official Telegram MTProxy)
 #   - authenticated SOCKS5 on TCP/1080 (Dante, TCP CONNECT only)
-#   - VLESS over WebSocket + TLS on TCP/9443 (Xray behind nginx)
+#   - VLESS over WebSocket + TLS on TCP/443 (via Teleproxy/nginx) and TCP/9443
 #   - a ready-to-import Happ subscription for the VLESS endpoint
 #   - Let's Encrypt renewal and daily Telegram relay-config refresh timers
 #
@@ -700,6 +700,23 @@ server {
     ssl_ecdh_curve X25519:prime256v1;
     ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256;
 
+    location = ${VLESS_WS_PATH} {
+        proxy_pass http://127.0.0.1:10000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+
+    location ^~ /happ/ {
+        root ${NGINX_ROOT};
+        default_type text/plain;
+        add_header Cache-Control "no-cache" always;
+        try_files \$uri =404;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
@@ -845,10 +862,11 @@ vless_uri() {
   local address=$1
   local tls_domain=$2
   local title=$3
+  local port=${4:-443}
   local encoded_path="%2F${VLESS_WS_PATH#/}"
 
-  printf 'vless://%s@%s:9443?encryption=none&security=tls&sni=%s&fp=safari&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
-    "${VLESS_UUID}" "${address}" "${tls_domain}" "${tls_domain}" "${encoded_path}" "${title}"
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=safari&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
+    "${VLESS_UUID}" "${address}" "${port}" "${tls_domain}" "${tls_domain}" "${encoded_path}" "${title}"
 }
 
 configure_xray() {
@@ -1030,14 +1048,14 @@ write_happ_subscription() {
     write_atomic 0644 "${subscription_file}" <<EOF
 #proxy-enable: 1
 #fragmentation-enable: 0
-$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-IPv4")
-$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-IPv6")
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")
+$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6")
 EOF
   else
     write_atomic 0644 "${subscription_file}" <<EOF
 #proxy-enable: 1
 #fragmentation-enable: 0
-$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-IPv4")
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")
 EOF
   fi
 }
@@ -1244,9 +1262,10 @@ verify_web_proxy_endpoint() {
 verify_vless_endpoint() {
   local address=$1
   local tls_domain=$2
-  local socks_port=$3
-  local check_url=$4
-  local expected_address=$5
+  local server_port=$3
+  local socks_port=$4
+  local check_url=$5
+  local expected_address=$6
   local client_config="${WORK_DIR}/xray-client-${socks_port}.json"
   local client_log="${WORK_DIR}/xray-client-${socks_port}.log"
   local result=""
@@ -1274,7 +1293,7 @@ verify_vless_endpoint() {
         "vnext": [
           {
             "address": "${address}",
-            "port": 9443,
+            "port": ${server_port},
             "users": [
               {
                 "id": "${VLESS_UUID}",
@@ -1332,7 +1351,7 @@ EOF
 
   if [[ "${result}" != "${expected_address}" ]]; then
     cat "${client_log}" >&2
-    die "VLESS test through ${address}:9443 returned '${result}' instead of '${expected_address}'."
+    die "VLESS test through ${address}:${server_port} returned '${result}' instead of '${expected_address}'."
   fi
 }
 
@@ -1379,7 +1398,9 @@ verify_services() {
   [[ "${socks_result}" == "${PUBLIC_IPV4}" ]] || \
     die "SOCKS5 test returned '${socks_result}' instead of '${PUBLIC_IPV4}'."
 
-  verify_vless_endpoint "${PUBLIC_IPV4}" "${DOMAIN}" 10991 \
+  verify_vless_endpoint "${PUBLIC_IPV4}" "${DOMAIN}" 443 10991 \
+    "https://api.ipify.org" "${PUBLIC_IPV4}"
+  verify_vless_endpoint "${PUBLIC_IPV4}" "${DOMAIN}" 9443 10993 \
     "https://api.ipify.org" "${PUBLIC_IPV4}"
 
   if ((ENABLE_IPV6)); then
@@ -1390,7 +1411,9 @@ verify_services() {
       https://api.ipify.org | tr -d '[:space:]')"
     [[ "${socks_result}" == "${PUBLIC_IPV4}" ]] || \
       die "SOCKS5 test through the IPv6 listener returned '${socks_result}' instead of '${PUBLIC_IPV4}'."
-    verify_vless_endpoint "${PUBLIC_IPV6}" "${DOMAIN_IPV6}" 10992 \
+    verify_vless_endpoint "${PUBLIC_IPV6}" "${DOMAIN_IPV6}" 443 10992 \
+      "https://api6.ipify.org" "${PUBLIC_IPV6}"
+    verify_vless_endpoint "${PUBLIC_IPV6}" "${DOMAIN_IPV6}" 9443 10994 \
       "https://api6.ipify.org" "${PUBLIC_IPV6}"
   fi
 }
@@ -1439,14 +1462,17 @@ socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${DOMAIN_IPV6}:1080#SOCKS5-IPv6
 VLESS WebSocket + TLS
 Type: VLESS
 Server: ${DOMAIN_IPV6}
-Port: 9443
+Ports: 443 (primary), 9443 (reserve)
 UUID: ${VLESS_UUID}
 Transport: WebSocket
 TLS/SNI/Host: ${DOMAIN_IPV6}
 Path: ${VLESS_WS_PATH}
 
-VLESS URI:
-$(vless_uri "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-IPv6")
+VLESS URI (primary):
+$(vless_uri "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6")
+
+VLESS URI (reserve):
+$(vless_uri "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-9443-IPv6" 9443)
 
 VIA IPV6 ADDRESS
 
@@ -1472,11 +1498,14 @@ Password: ${SOCKS_PASSWORD}
 Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@[${PUBLIC_IPV6}]:1080#SOCKS5-IPv6-IP
 
-VLESS URI:
-$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-IPv6-IP")
+VLESS URI (primary):
+$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6-IP")
+
+VLESS URI (reserve):
+$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-9443-IPv6-IP" 9443)
 
 Happ VLESS subscription over IPv6:
-https://${DOMAIN_IPV6}:9443/happ/${HAPP_SUBSCRIPTION_ID}.txt
+https://${DOMAIN_IPV6}/happ/${HAPP_SUBSCRIPTION_ID}.txt
 EOF
 )"
   fi
@@ -1519,17 +1548,20 @@ socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${DOMAIN}:1080#SOCKS5-IPv4
 VLESS WebSocket + TLS
 Type: VLESS
 Server: ${DOMAIN}
-Port: 9443
+Ports: 443 (primary), 9443 (reserve)
 UUID: ${VLESS_UUID}
 Transport: WebSocket
 TLS/SNI/Host: ${DOMAIN}
 Path: ${VLESS_WS_PATH}
 
-VLESS URI:
-$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-IPv4")
+VLESS URI (primary):
+$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")
+
+VLESS URI (reserve):
+$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4" 9443)
 
 Happ VLESS subscription:
-https://${DOMAIN}:9443/happ/${HAPP_SUBSCRIPTION_ID}.txt
+https://${DOMAIN}/happ/${HAPP_SUBSCRIPTION_ID}.txt
 
 VIA IPV4 ADDRESS
 
@@ -1555,8 +1587,11 @@ Password: ${SOCKS_PASSWORD}
 Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${PUBLIC_IPV4}:1080#SOCKS5-IPv4-IP
 
-VLESS URI:
-$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-IPv4-IP")
+VLESS URI (primary):
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4-IP")
+
+VLESS URI (reserve):
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4-IP" 9443)
 ${ipv6_output}
 
 ADMINISTRATION
