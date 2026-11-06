@@ -603,6 +603,7 @@ configure_nginx_and_certificate() {
 
   log "Configuring the public HTTP challenge endpoint"
   install -d -o www-data -g www-data -m 0755 "${NGINX_ROOT}/.well-known/acme-challenge"
+  rm -f /etc/nginx/sites-enabled/default
 
   write_atomic 0644 "${NGINX_SITE}" <<EOF
 map \$http_upgrade \$proxy_stack_connection {
@@ -1098,7 +1099,7 @@ Requires=nginx.service
 Type=simple
 EnvironmentFile=${STATE_DIR}/services.env
 WorkingDirectory=${MTPROXY_DIR}
-ExecStart=${TELEPROXY_BIN} --config ${MTPROXY_DIR}/teleproxy.toml -u nobody -p 8888 -H 443 -S \${RAW_SECRET} --http-stats --aes-pwd ${MTPROXY_DIR}/proxy-secret ${MTPROXY_DIR}/proxy-multi.conf -M 1
+ExecStart=${TELEPROXY_BIN} --config ${MTPROXY_DIR}/teleproxy.toml -u nobody -p 8888 -H 443 -S \${RAW_SECRET} --http-stats --stats-allow-net 127.0.0.0/8 --aes-pwd ${MTPROXY_DIR}/proxy-secret ${MTPROXY_DIR}/proxy-multi.conf -M 1
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
