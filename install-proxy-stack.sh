@@ -23,13 +23,13 @@ umask 077
 
 readonly TELEPROXY_VERSION="4.16.1"
 readonly TELEPROXY_SHA256_AMD64="6afbc40af530e61e4b6275f630dde947f29e84b6e72b22a43a83f5f5ce36d340"
-readonly MTPROXY_COMMIT="f36d8af769ffaeac36978d38c2c0f6d1104c2137"
-readonly TPROXY_SERVER_COMMIT="f7a6acc4d536a787d442fd7df3ba4ebfd728f406"
-readonly TPROXY_SERVER_SHA256_AMD64="9a235e27e43881f3186004143452d3145175b975195661bba38a3ced2ea5571e"
-readonly GO_VERSION="1.26.5"
-readonly GO_SHA256_AMD64="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
-readonly XRAY_VERSION="26.3.27"
-readonly XRAY_SHA256_AMD64="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+readonly MTPROXY_COMMIT="69f2f083b57bbd94932cb9f4f32155f33e719ff1"
+readonly TPROXY_SERVER_COMMIT="c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8"
+readonly TPROXY_SERVER_SHA256_AMD64="a78b48f536180143dd7005785ca397310c36ee0b132e19949a45d64f586ab549"
+readonly GO_VERSION="1.26.10"
+readonly GO_SHA256_AMD64="ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5"
+readonly XRAY_VERSION="26.11.9"
+readonly XRAY_SHA256_AMD64="b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82"
 
 readonly STATE_DIR="/etc/proxy-stack"
 readonly STATE_FILE="${STATE_DIR}/credentials.env"
@@ -394,10 +394,11 @@ install_teleproxy() {
 }
 
 install_official_mtproxy() {
+  local target_bin="${1:-${MTPROXY_BIN}}"
   local source_dir="${WORK_DIR}/MTProxy"
   local jobs
 
-  if [[ -x "${MTPROXY_BIN}" && -f "${STATE_DIR}/mtproxy.commit" ]] && \
+  if [[ "${target_bin}" == "${MTPROXY_BIN}" && -x "${MTPROXY_BIN}" && -f "${STATE_DIR}/mtproxy.commit" ]] && \
     [[ "$(<"${STATE_DIR}/mtproxy.commit")" == "${MTPROXY_COMMIT}" ]]; then
     log "Official MTProxy ${MTPROXY_COMMIT:0:12} is already installed"
     return
@@ -412,23 +413,17 @@ install_official_mtproxy() {
   jobs="$(nproc)"
   ((jobs > 4)) && jobs=4
   make -C "${source_dir}" -j "${jobs}"
-  install -o root -g root -m 0755 "${source_dir}/objs/bin/mtproto-proxy" "${MTPROXY_BIN}"
-  printf '%s\n' "${MTPROXY_COMMIT}" | write_atomic 0600 "${STATE_DIR}/mtproxy.commit"
+  install -o root -g root -m 0755 "${source_dir}/objs/bin/mtproto-proxy" "${target_bin}"
+  if [[ "${target_bin}" == "${MTPROXY_BIN}" ]]; then
+    printf '%s\n' "${MTPROXY_COMMIT}" | write_atomic 0600 "${STATE_DIR}/mtproxy.commit"
+  fi
 }
 
 select_go_toolchain() {
-  local go_minor=""
   local go_archive="${WORK_DIR}/go${GO_VERSION}.linux-amd64.tar.gz"
   local go_root="/opt/go${GO_VERSION}"
 
-  if command -v go >/dev/null 2>&1; then
-    go_minor="$(go env GOVERSION 2>/dev/null | sed -E 's/^go1\.([0-9]+).*/\1/')"
-    if [[ "${go_minor}" =~ ^[0-9]+$ ]] && ((go_minor >= 20)); then
-      GO_BIN="$(command -v go)"
-      return
-    fi
-  fi
-
+  # Always use the patched, pinned toolchain rather than any older Go on PATH.
   if [[ ! -x "${go_root}/bin/go" ]]; then
     log "Installing Go ${GO_VERSION} for Telegram WEB Proxy"
     curl -fL --retry 4 --retry-all-errors --connect-timeout 15 --max-time 180 \
@@ -439,14 +434,19 @@ select_go_toolchain() {
   fi
 
   GO_BIN="${go_root}/bin/go"
+  [[ "$(GOTOOLCHAIN=local "${GO_BIN}" env GOVERSION)" == "go${GO_VERSION}" ]] || \
+    die "The Go toolchain in ${go_root} does not match the pinned version."
 }
 
 install_tproxy_server() {
+  local target_bin="${1:-${TPROXY_SERVER_BIN}}"
   local archive="${WORK_DIR}/tproxy-server.tar.gz"
   local source_dir="${WORK_DIR}/tproxy-server-${TPROXY_SERVER_COMMIT}"
 
-  if [[ -x "${TPROXY_SERVER_BIN}" && -f "${STATE_DIR}/tproxy-server.commit" ]] && \
-    [[ "$(<"${STATE_DIR}/tproxy-server.commit")" == "${TPROXY_SERVER_COMMIT}" ]]; then
+  if [[ "${target_bin}" == "${TPROXY_SERVER_BIN}" && -x "${TPROXY_SERVER_BIN}" && \
+        -f "${STATE_DIR}/tproxy-server.commit" && -f "${STATE_DIR}/tproxy-server.go-version" ]] && \
+    [[ "$(<"${STATE_DIR}/tproxy-server.commit")" == "${TPROXY_SERVER_COMMIT}" && \
+       "$(<"${STATE_DIR}/tproxy-server.go-version")" == "${GO_VERSION}" ]]; then
     log "Telegram WEB Proxy relay ${TPROXY_SERVER_COMMIT:0:12} is already installed"
     return
   fi
@@ -463,14 +463,18 @@ install_tproxy_server() {
   # Upstream has a permission test that intentionally creates a 0444 file.
   # The installer's protective 0077 umask would silently turn it into 0400
   # and invalidate the test fixture, so run only the test subprocess at 0022.
-  (umask 0022; cd "${source_dir}" && "${GO_BIN}" test ./...)
-  (cd "${source_dir}" && CGO_ENABLED=0 "${GO_BIN}" build -trimpath -ldflags='-s -w' \
+  (umask 0022; cd "${source_dir}" && GOTOOLCHAIN=local "${GO_BIN}" test ./...)
+  (cd "${source_dir}" && CGO_ENABLED=0 GOTOOLCHAIN=local "${GO_BIN}" build -trimpath -ldflags='-s -w' \
     -o "${WORK_DIR}/tproxy-server" ./cmd/tproxy-server)
-  install -o root -g root -m 0755 "${WORK_DIR}/tproxy-server" "${TPROXY_SERVER_BIN}"
-  printf '%s\n' "${TPROXY_SERVER_COMMIT}" | write_atomic 0600 "${STATE_DIR}/tproxy-server.commit"
+  install -o root -g root -m 0755 "${WORK_DIR}/tproxy-server" "${target_bin}"
+  if [[ "${target_bin}" == "${TPROXY_SERVER_BIN}" ]]; then
+    printf '%s\n' "${TPROXY_SERVER_COMMIT}" | write_atomic 0600 "${STATE_DIR}/tproxy-server.commit"
+    printf '%s\n' "${GO_VERSION}" | write_atomic 0600 "${STATE_DIR}/tproxy-server.go-version"
+  fi
 }
 
 install_xray() {
+  local target_bin="${1:-${XRAY_BIN}}"
   local archive="${WORK_DIR}/Xray-linux-64.zip"
   local extract_dir="${WORK_DIR}/xray-release"
   local download_url
@@ -487,7 +491,7 @@ install_xray() {
   install -d -o root -g root -m 0755 "${extract_dir}"
   unzip -q "${archive}" -d "${extract_dir}"
   [[ -x "${extract_dir}/xray" ]] || die "The Xray archive did not contain an executable xray binary."
-  install -o root -g root -m 0755 "${extract_dir}/xray" "${XRAY_BIN}"
+  install -o root -g root -m 0755 "${extract_dir}/xray" "${target_bin}"
 }
 
 install_refresh_timer() {
@@ -1660,9 +1664,9 @@ main() {
   check_dns
   load_or_create_credentials
   install_teleproxy
-  install_official_mtproxy
-  install_tproxy_server
-  install_xray
+  install_official_mtproxy "${MTPROXY_BIN}"
+  install_tproxy_server "${TPROXY_SERVER_BIN}"
+  install_xray "${XRAY_BIN}"
   install_refresh_timer
   configure_firewall
   configure_nginx_and_certificate
@@ -1682,4 +1686,6 @@ main() {
   log "Pre-installation backups, if any, are in ${backup_dir}."
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
