@@ -13,16 +13,16 @@
 # password, add --rotate-socks-password. This is an explicit breaking change
 # for existing SOCKS5 clients.
 
-set -Eeuo pipefail
-IFS=$'\n\t'
-umask 077
-
-readonly STATE_FILE="/etc/proxy-stack/credentials.env"
-readonly OUTPUT_FILE="/root/proxy-credentials.txt"
-readonly MTPROXY_ENV="/etc/mtproxy/mtproxy.env"
-readonly TPROXY_SERVER_CONFIG="/etc/tproxy-server/config.json"
-readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
-readonly HAPP_DIR="/var/www/faketls/happ"
+# These paths are mutable after sourcing for isolated fixture tests. Normal
+# execution always starts with the fixed production paths below.
+STATE_FILE="/etc/proxy-stack/credentials.env"
+OUTPUT_FILE="/root/proxy-credentials.txt"
+MTPROXY_ENV="/etc/mtproxy/mtproxy.env"
+MTG_CONFIG="/etc/mtproxy/mtg.toml"
+TPROXY_SERVER_CONFIG="/etc/tproxy-server/config.json"
+TPROXY_SERVER_PROFILES="/etc/tproxy-server/profiles.json"
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+HAPP_DIR="/var/www/faketls/happ"
 
 DOMAIN=""
 DOMAIN_IPV6=""
@@ -33,6 +33,8 @@ SOCKS_USER="socksproxy"
 SOCKS_PASSWORD=""
 VLESS_UUID=""
 VLESS_WS_PATH=""
+VLESS_TLS_FINGERPRINT=""
+STATE_HAS_VLESS_TLS_FINGERPRINT=0
 HAPP_SUBSCRIPTION_ID=""
 REQUESTED_SUBSCRIPTION_ID=""
 ACTIVE_SUBSCRIPTION_FILE=""
@@ -55,8 +57,6 @@ cleanup() {
     rm -f -- "${TEMPORARY_OUTPUT}"
   fi
 }
-
-trap cleanup EXIT
 
 usage() {
   cat <<'USAGE'
@@ -126,6 +126,101 @@ canonical_ipv6() {
   python3 -c 'import ipaddress,sys; print(ipaddress.IPv6Address(sys.argv[1]))' "$1" 2>/dev/null
 }
 
+validate_vless_fingerprint() {
+  local value=$1
+
+  [[ ${#value} -le 64 ]] || die "Invalid VLESS TLS fingerprint."
+  case "${value}" in
+    chrome|firefox|safari|ios|android|edge|360|qq|random|randomized|unsafe)
+      return 0
+      ;;
+  esac
+  [[ "${value}" =~ ^Hello[A-Za-z0-9_]+$ ]] || die "Invalid VLESS TLS fingerprint."
+}
+
+active_subscription_fingerprint() {
+  # Parse URL-encoded query values, not shell text. Never eval/source a URI or
+  # print its UUID/secret when rejecting a malformed or inconsistent profile.
+  python3 - "${ACTIVE_SUBSCRIPTION_FILE}" "${MANAGED_INSTALL}" \
+    "${VLESS_UUID}" "${VLESS_WS_PATH}" "${DOMAIN}" "${DOMAIN_IPV6}" <<'PY'
+import re
+import sys
+from urllib.parse import parse_qs, unquote, urlsplit
+
+standard = {
+    "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+    "random", "randomized", "unsafe",
+}
+fingerprints = set()
+managed = sys.argv[2] == "1"
+domains = {value for value in sys.argv[5:7] if value}
+profiles = 0
+
+def single(query, name):
+    values = query.get(name, [])
+    if len(values) != 1:
+        raise ValueError("missing or duplicate query value")
+    return values[0]
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as subscription:
+        for line in subscription:
+            if not line.startswith("vless://"):
+                continue
+            line = line.rstrip("\r\n")
+            if any(ord(character) < 32 for character in line):
+                raise ValueError("control character in URI")
+            uri = urlsplit(line)
+            if not uri.hostname or not uri.username or not uri.port:
+                raise ValueError("incomplete VLESS URI")
+            query = parse_qs(uri.query, keep_blank_values=True)
+            if managed and not (
+                unquote(uri.username).lower() == sys.argv[3].lower()
+                and single(query, "security") == "tls"
+                and single(query, "type") == "ws"
+                and single(query, "path") == sys.argv[4]
+                and single(query, "sni") in domains
+                and single(query, "host") in domains
+            ):
+                raise ValueError("managed state does not match active profile")
+            profiles += 1
+            values = query.get("fp", [])
+            if len(values) > 1:
+                raise ValueError("duplicate fingerprint")
+            # Historical installer profiles used Safari. Do not change an old
+            # profile lacking an explicit fp merely because new installs use Edge.
+            value = values[0] if values else "safari"
+            if len(value) > 64 or not (
+                value in standard or re.fullmatch(r"Hello[A-Za-z0-9_]+", value)
+            ):
+                raise ValueError("unsupported fingerprint")
+            fingerprints.add(value)
+    if len(fingerprints) > 1:
+        raise ValueError("inconsistent fingerprints")
+    if managed and not profiles:
+        raise ValueError("managed subscription has no active VLESS profile")
+except (OSError, UnicodeError, ValueError):
+    sys.exit("Active Happ subscription is invalid or inconsistent with saved state.")
+if fingerprints:
+    print(next(iter(fingerprints)))
+PY
+}
+
+load_vless_fingerprint() {
+  local active_fingerprint
+
+  active_fingerprint="$(active_subscription_fingerprint)" || \
+    die "Refusing to reconstruct access from an invalid active Happ profile."
+  if ((STATE_HAS_VLESS_TLS_FINGERPRINT)); then
+    validate_vless_fingerprint "${VLESS_TLS_FINGERPRINT}"
+    [[ -z "${active_fingerprint}" || "${active_fingerprint}" == "${VLESS_TLS_FINGERPRINT}" ]] || \
+      die "Saved VLESS TLS fingerprint does not match the active Happ profile."
+  else
+    VLESS_TLS_FINGERPRINT="${active_fingerprint:-safari}"
+  fi
+  validate_vless_fingerprint "${VLESS_TLS_FINGERPRINT}"
+}
+
 vless_uri() {
   local address=$1
   local tls_domain=$2
@@ -133,14 +228,16 @@ vless_uri() {
   local port=${4:-443}
   local encoded_path="%2F${VLESS_WS_PATH#/}"
 
-  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=safari&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
-    "${VLESS_UUID}" "${address}" "${port}" "${tls_domain}" "${tls_domain}" "${encoded_path}" "${title}"
+  validate_vless_fingerprint "${VLESS_TLS_FINGERPRINT}"
+  [[ -n "${VLESS_WS_PATH}" ]] || die "Cannot construct a WebSocket URI without its active path."
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
+    "${VLESS_UUID}" "${address}" "${port}" "${tls_domain}" "${VLESS_TLS_FINGERPRINT}" "${tls_domain}" "${encoded_path}" "${title}"
 }
 
 update_managed_socks_password() {
   local replacement_file
 
-  replacement_file="$(mktemp /etc/proxy-stack/.credentials.XXXXXX)"
+  replacement_file="$(mktemp "${STATE_FILE%/*}/.credentials.XXXXXX")"
   awk -v password="${SOCKS_PASSWORD}" '
     /^SOCKS_PASSWORD=/ {print "SOCKS_PASSWORD=" password; found=1; next}
     {print}
@@ -153,6 +250,7 @@ update_managed_socks_password() {
 load_managed_state() {
   local requested_domain=$1
   local requested_ipv6_domain=$2
+  local fingerprint_fields
 
   MANAGED_INSTALL=1
   DOMAIN="$(state_value DOMAIN)"
@@ -162,6 +260,13 @@ load_managed_state() {
   SOCKS_PASSWORD="$(state_value SOCKS_PASSWORD)"
   VLESS_UUID="$(state_value VLESS_UUID)"
   VLESS_WS_PATH="$(state_value VLESS_WS_PATH)"
+  VLESS_TLS_FINGERPRINT="$(state_value VLESS_TLS_FINGERPRINT)"
+  STATE_HAS_VLESS_TLS_FINGERPRINT=0
+  fingerprint_fields="$(awk '/^VLESS_TLS_FINGERPRINT=/ {count++} END {print count+0}' "${STATE_FILE}")"
+  ((fingerprint_fields <= 1)) || die "Duplicate VLESS TLS fingerprint fields in saved state."
+  if ((fingerprint_fields)); then
+    STATE_HAS_VLESS_TLS_FINGERPRINT=1
+  fi
   HAPP_SUBSCRIPTION_ID="$(state_value HAPP_SUBSCRIPTION_ID)"
 
   [[ -z "${requested_domain}" || "${requested_domain}" == "${DOMAIN}" ]] || \
@@ -239,6 +344,9 @@ validate_state() {
   [[ "${SOCKS_USER}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "Invalid SOCKS5 username."
   [[ "${VLESS_UUID}" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Invalid VLESS UUID."
   [[ -z "${VLESS_WS_PATH}" || "${VLESS_WS_PATH}" == /* ]] || die "Invalid VLESS WebSocket path."
+  if ((STATE_HAS_VLESS_TLS_FINGERPRINT)); then
+    validate_vless_fingerprint "${VLESS_TLS_FINGERPRINT}"
+  fi
 
   if ((MANAGED_INSTALL)); then
     [[ "${SOCKS_PASSWORD}" =~ ^[0-9a-f]{32}$ ]] || die "Invalid SOCKS5 password in ${STATE_FILE}."
@@ -272,24 +380,33 @@ build_subscription_output() {
 }
 
 build_manual_vless_output() {
-  local output=""
+  local uri
+  local found=0
 
   while IFS= read -r uri; do
     [[ -n "${uri}" ]] || continue
-    if [[ "${output}" != *"${uri}"* ]]; then
-      output+="${uri}\n\n"
-    fi
-  done < <(grep '^vless://' "${ACTIVE_SUBSCRIPTION_FILE}" || true)
+    printf '%s\n\n' "${uri}"
+    found=1
+  done < <(awk '/^vless:\/\// && !seen[$0]++' "${ACTIVE_SUBSCRIPTION_FILE}")
 
-  if [[ -z "${output}" && -n "${VLESS_WS_PATH}" ]]; then
-    output+="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")\n\n"
+  if ((found == 0)); then
+    printf 'No plain VLESS URI found in the selected subscription; no alternative is synthesized.\n'
+  fi
+}
+
+build_managed_vless_output() {
+  local address=$1
+  local tls_domain=$2
+  local address_title=$3
+
+  if ((MANAGED_INSTALL == 0)); then
+    printf 'Manual installation: use the active URI(s) above; IP/reserve alternatives are not synthesized.'
+    return
   fi
 
-  if [[ -n "${VLESS_WS_PATH}" ]]; then
-    output+="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4" 9443)\n\n"
-  fi
-
-  printf '%b' "${output}"
+  printf '%s\n\n%s' \
+    "$(vless_uri "${address}" "${tls_domain}" "${tls_domain}-VLESS-WS-443-${address_title}")" \
+    "$(vless_uri "${address}" "${tls_domain}" "${tls_domain}-VLESS-WS-9443-${address_title}" 9443)"
 }
 
 write_credentials() {
@@ -301,6 +418,17 @@ write_credentials() {
   local subscription_output
   local vless_output
   local web_proxy_output=""
+  local faketls_config_output="Teleproxy config: /etc/mtproxy/teleproxy.toml"
+  local mtproto_state_path="${MTPROXY_ENV}"
+
+  if ((MANAGED_INSTALL)); then
+    mtproto_state_path="${STATE_FILE}"
+  fi
+
+  if [[ -r "${MTG_CONFIG}" ]]; then
+    faketls_config_output="MTG config: ${MTG_CONFIG}
+FakeTLS service: teleproxy.service (compatibility service name)"
+  fi
 
   domain_hex_ipv4="$(printf '%s' "${DOMAIN}" | xxd -p -c 256)"
   faketls_secret_ipv4="ee${RAW_SECRET}${domain_hex_ipv4}"
@@ -308,17 +436,15 @@ write_credentials() {
   subscription_output="$(build_subscription_output)"
 
   if ((MANAGED_INSTALL)); then
-    vless_output="$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")
-
-$(vless_uri "${DOMAIN}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4" 9443)"
+    vless_output="$(build_managed_vless_output "${DOMAIN}" "${DOMAIN}" IPv4)"
   else
     vless_output="$(build_manual_vless_output)"
   fi
 
-  if [[ -r "${TPROXY_SERVER_CONFIG}" && -r /etc/tproxy-server/profiles.json ]] && \
+  if [[ -r "${TPROXY_SERVER_CONFIG}" && -r "${TPROXY_SERVER_PROFILES}" ]] && \
     jq -e --arg domain "${DOMAIN}" '.public_hostname == $domain' "${TPROXY_SERVER_CONFIG}" >/dev/null && \
     jq -e --arg secret "dd${RAW_SECRET}" \
-      '.profiles | any(.secret == $secret)' /etc/tproxy-server/profiles.json >/dev/null; then
+      '.profiles | any(.secret == $secret)' "${TPROXY_SERVER_PROFILES}" >/dev/null; then
     web_proxy_output="$(cat <<EOF
 
 Telegram WEB Proxy (experimental)
@@ -331,7 +457,7 @@ EOF
 )"
   fi
 
-  TEMPORARY_OUTPUT="$(mktemp /root/.proxy-credentials.XXXXXX)"
+  TEMPORARY_OUTPUT="$(mktemp "${OUTPUT_FILE%/*}/.proxy-credentials.XXXXXX")"
   cat >"${TEMPORARY_OUTPUT}" <<EOF
 PROXY CONFIGURATION
 Generated: $(date --iso-8601=seconds)
@@ -369,6 +495,7 @@ Ports: 443 (primary), 9443 (reserve)
 UUID: ${VLESS_UUID}
 Transport: WebSocket
 TLS/SNI/Host: ${DOMAIN}
+TLS fingerprint: ${VLESS_TLS_FINGERPRINT}
 Path: ${VLESS_WS_PATH:-see URI}
 
 VLESS client URI(s):
@@ -399,9 +526,7 @@ Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${PUBLIC_IPV4}:1080#SOCKS5-IPv4-IP
 
 VLESS client URI(s):
-$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4-IP")
-
-$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4-IP" 9443)
+$(build_managed_vless_output "${PUBLIC_IPV4}" "${DOMAIN}" IPv4-IP)
 EOF
 
   if [[ -n "${DOMAIN_IPV6}" ]]; then
@@ -434,9 +559,7 @@ Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@${DOMAIN_IPV6}:1080#SOCKS5-IPv6
 
 VLESS client URI(s):
-$(vless_uri "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6")
-
-$(vless_uri "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-9443-IPv6" 9443)
+$(build_managed_vless_output "${DOMAIN_IPV6}" "${DOMAIN_IPV6}" IPv6)
 
 VIA IPV6 ADDRESS
 
@@ -463,9 +586,7 @@ Happ SOCKS URI:
 socks://${SOCKS_USER}:${SOCKS_PASSWORD}@[${PUBLIC_IPV6}]:1080#SOCKS5-IPv6-IP
 
 VLESS client URI(s):
-$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6-IP")
-
-$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-9443-IPv6-IP" 9443)
+$(build_managed_vless_output "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" IPv6-IP)
 EOF
   fi
 
@@ -478,8 +599,8 @@ ADMINISTRATION
 
 Credentials file: ${OUTPUT_FILE}
 Persistent installer state: ${STATE_FILE}
-MTProto state: ${MTPROXY_ENV}
-Teleproxy config: /etc/mtproxy/teleproxy.toml
+MTProto state: ${mtproto_state_path}
+${faketls_config_output}
 Telegram WEB Proxy config: ${TPROXY_SERVER_CONFIG}
 SOCKS5 config: /etc/danted.conf
 Xray config: ${XRAY_CONFIG}
@@ -550,6 +671,7 @@ main() {
 
   validate_state
   select_active_subscription
+  load_vless_fingerprint
   PUBLIC_IPV4="$(resolve_single_record A "${DOMAIN}")"
   if [[ -n "${DOMAIN_IPV6}" ]]; then
     PUBLIC_IPV6="$(canonical_ipv6 "$(resolve_single_record AAAA "${DOMAIN_IPV6}")")" || \
@@ -568,4 +690,10 @@ main() {
   fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  set -Eeuo pipefail
+  IFS=$'\n\t'
+  umask 077
+  trap cleanup EXIT
+  main "$@"
+fi

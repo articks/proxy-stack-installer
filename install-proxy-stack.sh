@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # Deploy on a clean Ubuntu/Debian VPS:
-#   - Fake-TLS MTProto on TCP/443 (Teleproxy + a real nginx TLS backend)
+#   - Fake-TLS MTProto on TCP/443 (MTG + a real nginx TLS backend)
 #   - Telegram WEB Proxy over HTTPS/443 (tproxy-server behind nginx)
 #   - legacy random-padding MTProto on TCP/8443 (official Telegram MTProxy)
 #   - authenticated SOCKS5 on TCP/1080 (Dante, TCP CONNECT only)
-#   - VLESS over WebSocket + TLS on TCP/443 (via Teleproxy/nginx) and TCP/9443
+#   - VLESS over WebSocket + TLS on TCP/443 (via MTG/nginx) and TCP/9443
 #   - a ready-to-import Happ subscription for the VLESS endpoint
 #   - Let's Encrypt renewal and daily Telegram relay-config refresh timers
 #
@@ -21,8 +21,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly TELEPROXY_VERSION="4.16.1"
-readonly TELEPROXY_SHA256_AMD64="6afbc40af530e61e4b6275f630dde947f29e84b6e72b22a43a83f5f5ce36d340"
+readonly MTG_VERSION="2.3.0"
+readonly MTG_SHA256_AMD64="11c038ea5eeebd5d49148048975c24f7b0c4fa4c1cf4f15a2410203e2da01812"
 readonly MTPROXY_COMMIT="69f2f083b57bbd94932cb9f4f32155f33e719ff1"
 readonly TPROXY_SERVER_COMMIT="c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8"
 readonly TPROXY_SERVER_SHA256_AMD64="a78b48f536180143dd7005785ca397310c36ee0b132e19949a45d64f586ab549"
@@ -34,9 +34,14 @@ readonly XRAY_SHA256_AMD64="b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8
 readonly STATE_DIR="/etc/proxy-stack"
 readonly STATE_FILE="${STATE_DIR}/credentials.env"
 readonly INSTALL_MARKER="${STATE_DIR}/installed"
+readonly FRONTEND_METADATA="${STATE_DIR}/frontend.env"
 readonly CREDENTIALS_OUTPUT="/root/proxy-credentials.txt"
 readonly MTPROXY_DIR="/etc/mtproxy"
+# Kept only to recognize an existing C frontend during a non-migrating upgrade.
 readonly TELEPROXY_BIN="/usr/local/bin/teleproxy"
+readonly MTG_BIN="/usr/local/bin/mtg"
+readonly MTG_CONFIG="${MTPROXY_DIR}/mtg.toml"
+readonly MTG_IPV6_CONFIG="${MTPROXY_DIR}/mtg-ipv6.toml"
 readonly MTPROXY_BIN="/usr/local/bin/mtproto-proxy"
 readonly TPROXY_SERVER_BIN="/usr/local/bin/tproxy-server"
 readonly TPROXY_SERVER_DIR="/etc/tproxy-server"
@@ -62,6 +67,8 @@ SOCKS_PASSWORD=""
 VLESS_UUID=""
 VLESS_WS_PATH=""
 HAPP_SUBSCRIPTION_ID=""
+VLESS_TLS_FINGERPRINT="edge"
+FAKETLS_ENGINE="mtg"
 XRAY_TEST_PID=""
 GO_BIN=""
 
@@ -95,9 +102,6 @@ on_error() {
   printf '[proxy-stack] Inspect logs with: journalctl -u teleproxy -u tproxy-server -u mtproxy -u danted -u xray -u nginx --no-pager -n 150\n' >&2
   exit "${exit_code}"
 }
-
-trap cleanup EXIT
-trap 'on_error ${LINENO}' ERR
 
 usage() {
   cat <<'USAGE'
@@ -152,9 +156,25 @@ canonical_ipv6() {
   python3 -c 'import ipaddress,sys; print(ipaddress.IPv6Address(sys.argv[1]))' "$1" 2>/dev/null
 }
 
+validate_vless_fingerprint() {
+  local value=$1
+  [[ ${#value} -le 64 ]] || die "VLESS TLS fingerprint is too long."
+  case "${value}" in
+    chrome|firefox|safari|ios|android|edge|360|qq|random|randomized|unsafe) ;;
+    *) [[ "${value}" =~ ^Hello[A-Za-z0-9_]+$ ]] || die "Invalid VLESS TLS fingerprint."
+  esac
+}
+
 state_value() {
   local key=$1
   awk -F= -v wanted="${key}" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "${STATE_FILE}"
+}
+
+check_existing_domains() {
+  # Run before backups, package work or service shutdown on a managed host.
+  [[ -f "${STATE_FILE}" ]] || return 0
+  [[ "$(state_value DOMAIN)" == "${DOMAIN}" && "$(state_value DOMAIN_IPV6)" == "${DOMAIN_IPV6}" ]] || \
+    die "This server was initialized for different domains; refusing to replace them."
 }
 
 write_atomic() {
@@ -186,7 +206,7 @@ check_clean_ports() {
   local port
 
   if [[ -f "${STATE_FILE}" ]]; then
-    systemctl stop teleproxy.service tproxy-server.service mtproxy-ipv6.service mtproxy.service danted.service xray.service 2>/dev/null || true
+    systemctl stop teleproxy.service teleproxy-ipv6.service tproxy-server.service mtproxy-ipv6.service mtproxy.service danted.service xray.service 2>/dev/null || true
   fi
 
   for port in 443 8443 9443 1080 8080 8081 8444 8888 8889 10000; do
@@ -199,6 +219,9 @@ check_clean_ports() {
       die "TCP port ${port} is already occupied. Run this installer on a clean VPS or free the port first."
     fi
   done
+  if ((ENABLE_IPV6)) && port_is_listening 8890; then
+    die "TCP port 8890 is already occupied; it is required for loopback IPv6 MTG metrics."
+  fi
 
   if port_is_listening 80 && ! systemctl is-active --quiet nginx.service; then
     ss -H -ltnp | awk '$4 ~ /:80$/ {print}' >&2 || true
@@ -290,6 +313,9 @@ check_dns() {
     die "${DOMAIN} resolves to '${ipv4_records[*]}', but this VPS is ${PUBLIC_IPV4}. Point one DNS-only A record to ${PUBLIC_IPV4} and wait for propagation."
 
   log "IPv4 DNS is correct: ${DOMAIN} -> ${PUBLIC_IPV4}"
+  ip -4 -o address show | awk -v wanted="${PUBLIC_IPV4}" \
+    '{sub(/\/.*/, "", $4); if ($4 == wanted) found=1} END {exit !found}' || \
+    die "Public IPv4 ${PUBLIC_IPV4} must be assigned to this VPS for the dedicated MTG listener."
 
   ((ENABLE_IPV6)) || return 0
 
@@ -320,6 +346,7 @@ check_dns() {
 load_or_create_credentials() {
   local saved_domain
   local saved_domain_ipv6
+  local fingerprint_fields
   local rewrite_state=0
 
   install -d -o root -g root -m 0700 "${STATE_DIR}"
@@ -337,6 +364,15 @@ load_or_create_credentials() {
     VLESS_UUID="$(state_value VLESS_UUID)"
     VLESS_WS_PATH="$(state_value VLESS_WS_PATH)"
     HAPP_SUBSCRIPTION_ID="$(state_value HAPP_SUBSCRIPTION_ID)"
+    VLESS_TLS_FINGERPRINT="$(state_value VLESS_TLS_FINGERPRINT)"
+    fingerprint_fields="$(awk '/^VLESS_TLS_FINGERPRINT=/ {count++} END {print count+0}' "${STATE_FILE}")"
+    if [[ "${fingerprint_fields}" == 0 ]]; then
+      VLESS_TLS_FINGERPRINT="edge"
+      rewrite_state=1
+    elif [[ "${fingerprint_fields}" != 1 ]]; then
+      die "Duplicate VLESS TLS fingerprint fields in ${STATE_FILE}."
+    fi
+    validate_vless_fingerprint "${VLESS_TLS_FINGERPRINT}"
     [[ "${RAW_SECRET}" =~ ^[0-9a-f]{32}$ ]] || die "Invalid RAW_SECRET in ${STATE_FILE}."
     [[ "${SOCKS_USER}" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || die "Invalid SOCKS_USER in ${STATE_FILE}."
     [[ "${SOCKS_PASSWORD}" =~ ^[0-9a-f]{32}$ ]] || die "Invalid SOCKS_PASSWORD in ${STATE_FILE}."
@@ -348,7 +384,7 @@ load_or_create_credentials() {
       VLESS_WS_PATH="/$(openssl rand -hex 16)"
       rewrite_state=1
     fi
-    if [[ ! "${HAPP_SUBSCRIPTION_ID}" =~ ^[0-9a-f]{40}$ ]]; then
+    if [[ ! "${HAPP_SUBSCRIPTION_ID}" =~ ^[0-9a-f]{32,64}$ ]]; then
       HAPP_SUBSCRIPTION_ID="$(openssl rand -hex 20)"
       rewrite_state=1
     fi
@@ -371,26 +407,37 @@ SOCKS_PASSWORD=${SOCKS_PASSWORD}
 VLESS_UUID=${VLESS_UUID}
 VLESS_WS_PATH=${VLESS_WS_PATH}
 HAPP_SUBSCRIPTION_ID=${HAPP_SUBSCRIPTION_ID}
+VLESS_TLS_FINGERPRINT=${VLESS_TLS_FINGERPRINT}
 EOF
-    log "Generated and saved proxy credentials"
+    log "Saved proxy credentials and the TLS fingerprint (existing secrets are reused)"
   else
     log "Reusing the existing client credentials"
   fi
 }
 
-install_teleproxy() {
-  local download_url
-  local downloaded_binary="${WORK_DIR}/teleproxy-linux-amd64"
+install_mtg() {
+  local target_bin="${1:-${MTG_BIN}}"
+  local archive="${WORK_DIR}/mtg-${MTG_VERSION}-linux-amd64.tar.gz"
+  local extract_dir="${WORK_DIR}/mtg-release"
+  local archive_member="mtg-${MTG_VERSION}-linux-amd64/mtg"
 
   [[ "$(uname -m)" == "x86_64" ]] || \
     die "This installer currently supports x86_64 only because the official legacy MTProxy is x86-specific."
 
-  log "Installing Teleproxy ${TELEPROXY_VERSION} with SHA-256 verification"
-  download_url="https://github.com/teleproxy/teleproxy/releases/download/v${TELEPROXY_VERSION}/teleproxy-linux-amd64"
+  log "Installing MTG ${MTG_VERSION} with SHA-256 verification"
   curl -fL --retry 4 --retry-all-errors --connect-timeout 15 --max-time 180 \
-    "${download_url}" -o "${downloaded_binary}"
-  printf '%s  %s\n' "${TELEPROXY_SHA256_AMD64}" "${downloaded_binary}" | sha256sum --check --status
-  install -o root -g root -m 0755 "${downloaded_binary}" "${TELEPROXY_BIN}"
+    "https://github.com/9seconds/mtg/releases/download/v${MTG_VERSION}/mtg-${MTG_VERSION}-linux-amd64.tar.gz" \
+    -o "${archive}"
+  printf '%s  %s\n' "${MTG_SHA256_AMD64}" "${archive}" | sha256sum --check --status
+  install -d -o root -g root -m 0755 "${extract_dir}"
+  tar -C "${extract_dir}" -xzf "${archive}" -- "${archive_member}"
+  [[ -x "${extract_dir}/${archive_member}" && ! -L "${extract_dir}/${archive_member}" ]] || \
+    die "The MTG archive did not contain the expected regular executable."
+  install -o root -g root -m 0755 "${extract_dir}/${archive_member}" "${target_bin}"
+  if [[ "${target_bin}" == "${MTG_BIN}" ]]; then
+    printf '%s\n' "${MTG_VERSION}" | write_atomic 0600 "${STATE_DIR}/mtg.version"
+    printf '%s\n' "${MTG_SHA256_AMD64}" | write_atomic 0600 "${STATE_DIR}/mtg.archive.sha256"
+  fi
 }
 
 install_official_mtproxy() {
@@ -463,8 +510,12 @@ install_tproxy_server() {
   # Upstream has a permission test that intentionally creates a 0444 file.
   # The installer's protective 0077 umask would silently turn it into 0400
   # and invalidate the test fixture, so run only the test subprocess at 0022.
-  (umask 0022; cd "${source_dir}" && GOTOOLCHAIN=local "${GO_BIN}" test ./...)
-  (cd "${source_dir}" && CGO_ENABLED=0 GOTOOLCHAIN=local "${GO_BIN}" build -trimpath -ldflags='-s -w' \
+  # Noninteractive/systemd-run deployments may have no HOME. Keep both caches
+  # in the bounded build workspace instead of depending on the login shell.
+  (umask 0022; cd "${source_dir}" && GOCACHE="${WORK_DIR}/go-build" GOPATH="${WORK_DIR}/go" \
+    GOTOOLCHAIN=local "${GO_BIN}" test ./...)
+  (cd "${source_dir}" && GOCACHE="${WORK_DIR}/go-build" GOPATH="${WORK_DIR}/go" \
+    CGO_ENABLED=0 GOTOOLCHAIN=local "${GO_BIN}" build -trimpath -ldflags='-s -w' \
     -o "${WORK_DIR}/tproxy-server" ./cmd/tproxy-server)
   install -o root -g root -m 0755 "${WORK_DIR}/tproxy-server" "${target_bin}"
   if [[ "${target_bin}" == "${TPROXY_SERVER_BIN}" ]]; then
@@ -524,7 +575,14 @@ if [[ ! -f "${target_dir}/proxy-multi.conf" ]] || ! cmp -s "${work_dir}/proxy-mu
 fi
 
 if ((changed)); then
-  for unit in mtproxy.service teleproxy.service; do
+  units=(mtproxy.service)
+  # MTG has its own Telegram connection logic and does not read these files.
+  # Keep the old C frontend compatible without interrupting an MTG frontend.
+  if systemctl show teleproxy.service -p ExecStart --value 2>/dev/null | \
+    grep -Fq '/usr/local/bin/teleproxy'; then
+    units+=(teleproxy.service)
+  fi
+  for unit in "${units[@]}"; do
     if systemctl is-active --quiet "${unit}"; then
       systemctl restart "${unit}"
     fi
@@ -778,7 +836,10 @@ EOF
 set -Eeuo pipefail
 nginx -t
 systemctl reload nginx.service
-systemctl try-restart teleproxy.service
+if systemctl show teleproxy.service -p ExecStart --value 2>/dev/null | \
+  grep -Fq '/usr/local/bin/teleproxy'; then
+  systemctl try-restart teleproxy.service
+fi
 EOF
 
   nginx -t
@@ -870,8 +931,10 @@ vless_uri() {
   local port=${4:-443}
   local encoded_path="%2F${VLESS_WS_PATH#/}"
 
-  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=safari&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
-    "${VLESS_UUID}" "${address}" "${port}" "${tls_domain}" "${tls_domain}" "${encoded_path}" "${title}"
+  validate_vless_fingerprint "${VLESS_TLS_FINGERPRINT}"
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=%s&alpn=http%%2F1.1&type=ws&host=%s&path=%s#%s' \
+    "${VLESS_UUID}" "${address}" "${port}" "${tls_domain}" "${VLESS_TLS_FINGERPRINT}" \
+    "${tls_domain}" "${encoded_path}" "${title}"
 }
 
 configure_xray() {
@@ -1054,59 +1117,84 @@ write_happ_subscription() {
 #proxy-enable: 1
 #fragmentation-enable: 0
 $(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4" 9443)
 $(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-443-IPv6")
+$(vless_uri "[${PUBLIC_IPV6}]" "${DOMAIN_IPV6}" "${DOMAIN_IPV6}-VLESS-WS-9443-IPv6" 9443)
 EOF
   else
     write_atomic 0644 "${subscription_file}" <<EOF
 #proxy-enable: 1
 #fragmentation-enable: 0
 $(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-443-IPv4")
+$(vless_uri "${PUBLIC_IPV4}" "${DOMAIN}" "${DOMAIN}-VLESS-WS-9443-IPv4" 9443)
 EOF
   fi
 }
 
-install_proxy_services() {
-  local teleproxy_ipv6="false"
-  local teleproxy_domain_entries="  { name = \"${DOMAIN}\", backend = \"127.0.0.1:8444\" },"
+write_mtg_config() {
+  local config_file=$1
+  local domain=$2
+  local bind_address=$3
+  local public_ip_key=$4
+  local public_ip=$5
+  local prefer_ip=$6
+  local stats_port=$7
+  local domain_hex
 
-  if ((ENABLE_IPV6)); then
-    teleproxy_ipv6="true"
-    teleproxy_domain_entries+=$'\n'"  { name = \"${DOMAIN_IPV6}\", backend = \"127.0.0.1:8444\" },"
-  fi
+  domain_hex="$(printf '%s' "${domain}" | xxd -p -c 256)"
+  write_atomic 0600 "${config_file}" <<EOF
+debug = false
+secret = "ee${RAW_SECRET}${domain_hex}"
+bind-to = "${bind_address}:443"
+prefer-ip = "${prefer_ip}"
+${public_ip_key} = "${public_ip}"
+auto-update = false
 
-  write_atomic 0600 "${STATE_DIR}/services.env" <<EOF
-DOMAIN=${DOMAIN}
-DOMAIN_IPV6=${DOMAIN_IPV6}
-RAW_SECRET=${RAW_SECRET}
+[domain-fronting]
+host = "127.0.0.1"
+port = 8444
+
+[network]
+dns = ""
+
+# Match the previous frontend's client policy. Authentication and the default
+# anti-replay checks remain enabled; external blocklists are not required.
+[defense.blocklist]
+enabled = false
+
+[stats.prometheus]
+enabled = true
+bind-to = "127.0.0.1:${stats_port}"
+http-path = "/stats"
+metric-prefix = "mtg"
 EOF
+}
 
-  # Teleproxy 4.16.1 does not enable its documented default MSS clamp when
-  # all options are supplied only via CLI. Load it explicitly from TOML and
-  # use the TOML domain table for a separate local camouflage backend.
-  write_atomic 0644 "${MTPROXY_DIR}/teleproxy.toml" <<EOF
-mss_clamp = true
-ipv6 = ${teleproxy_ipv6}
+write_mtg_unit() {
+  local unit_name=$1
+  local config_file=$2
+  local family=$3
 
-domain = [
-${teleproxy_domain_entries}
-]
-EOF
-
-  write_atomic 0644 "/etc/systemd/system/teleproxy.service" <<EOF
+  write_atomic 0644 "/etc/systemd/system/${unit_name}" <<EOF
 [Unit]
-Description=Teleproxy Fake-TLS MTProto proxy
+Description=MTG FakeTLS MTProto frontend (${family}, compatible service name)
 Wants=network-online.target
 After=network-online.target nginx.service
 Requires=nginx.service
 
 [Service]
 Type=simple
-EnvironmentFile=${STATE_DIR}/services.env
+User=mtg
+Group=mtg
+EnvironmentFile=
 WorkingDirectory=${MTPROXY_DIR}
-ExecStart=${TELEPROXY_BIN} --config ${MTPROXY_DIR}/teleproxy.toml -u nobody -p 8888 -H 443 -S \${RAW_SECRET} --http-stats --stats-allow-net 127.0.0.0/8 --aes-pwd ${MTPROXY_DIR}/proxy-secret ${MTPROXY_DIR}/proxy-multi.conf -M 1
+LoadCredential=mtg.toml:${config_file}
+ExecStart=${MTG_BIN} run %d/mtg.toml
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateDevices=true
 PrivateTmp=true
@@ -1117,10 +1205,81 @@ ProtectKernelTunables=true
 ProtectSystem=full
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+verify_mtg_config() {
+  local config_file=$1
+  local family=$2
+  local private_log="${STATE_DIR}/mtg-doctor-${family}.log"
+
+  # doctor checks the EE secret, fronting TLS, Telegram, DNS and time without
+  # binding the live listener. Never dump a private configuration/error log.
+  if ! "${MTG_BIN}" doctor "${config_file}" >"${private_log}" 2>&1; then
+    chmod 0600 "${private_log}"
+    die "MTG doctor failed for ${family}; inspect the root-only ${private_log}."
+  fi
+  chmod 0600 "${private_log}"
+}
+
+configure_mtg_frontends() {
+  local ipv6_metadata=""
+  if id mtg >/dev/null 2>&1; then
+    [[ "$(id -u mtg)" != 0 && "$(id -gn mtg)" == mtg && \
+       "$(getent passwd mtg | cut -d: -f7)" == /usr/sbin/nologin ]] || \
+      die "An existing mtg account is not the dedicated unprivileged service account."
+  else
+    useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin mtg
+  fi
+
+  # MTG checks the SNI embedded in each EE secret. Separate exact-IP listeners
+  # are required for the two domain names, without Go wildcard dual-stack binds.
+  write_mtg_config "${MTG_CONFIG}" "${DOMAIN}" "${PUBLIC_IPV4}" \
+    public-ipv4 "${PUBLIC_IPV4}" only-ipv4 8888
+  write_mtg_unit teleproxy.service "${MTG_CONFIG}" IPv4
+  verify_mtg_config "${MTG_CONFIG}" ipv4
+
+  if ((ENABLE_IPV6)); then
+    write_mtg_config "${MTG_IPV6_CONFIG}" "${DOMAIN_IPV6}" "[${PUBLIC_IPV6}]" \
+      public-ipv6 "${PUBLIC_IPV6}" prefer-ipv6 8890
+    write_mtg_unit teleproxy-ipv6.service "${MTG_IPV6_CONFIG}" IPv6
+    verify_mtg_config "${MTG_IPV6_CONFIG}" ipv6
+    ipv6_metadata="$(printf '%s\n' 'FAKETLS_IPV6_SERVICE=teleproxy-ipv6.service' \
+      "FAKETLS_IPV6_CONFIG=${MTG_IPV6_CONFIG}")"
+  fi
+
+  write_atomic 0600 "${FRONTEND_METADATA}" <<EOF
+FAKETLS_ENGINE=mtg
+FAKETLS_SERVICE=teleproxy.service
+FAKETLS_CONFIG=${MTG_CONFIG}
+FAKETLS_BINARY=${MTG_BIN}
+VLESS_TLS_FINGERPRINT=${VLESS_TLS_FINGERPRINT}
+${ipv6_metadata}
+EOF
+}
+
+install_proxy_services() {
+  local backup_dir=${1:-}
+  local compatibility_dropin=/etc/systemd/system/teleproxy.service.d/90-proxy-stack-mtg.conf
+
+  write_atomic 0600 "${STATE_DIR}/services.env" <<EOF
+DOMAIN=${DOMAIN}
+DOMAIN_IPV6=${DOMAIN_IPV6}
+RAW_SECRET=${RAW_SECRET}
+EOF
+
+  configure_mtg_frontends
+  # Fold our earlier host-local override into the canonical unit. Preserve it
+  # in the installation backup; unrelated operator drop-ins are never removed.
+  if [[ -f "${compatibility_dropin}" ]] && \
+    grep -Fxq '# Proxy Stack MTG compatible frontend' "${compatibility_dropin}"; then
+    [[ -d "${backup_dir}" ]] || die "A backup directory is required to retire the previous MTG override."
+    mv -- "${compatibility_dropin}" "${backup_dir}/retired-mtg-override.conf"
+  fi
 
   write_atomic 0644 "/etc/systemd/system/mtproxy.service" <<EOF
 [Unit]
@@ -1181,7 +1340,7 @@ EOF
   systemctl daemon-reload
   systemctl enable mtproxy-config-refresh.timer mtproxy.service teleproxy.service tproxy-server.service danted.service xray.service
   if ((ENABLE_IPV6)); then
-    systemctl enable mtproxy-ipv6.service
+    systemctl enable mtproxy-ipv6.service teleproxy-ipv6.service
   fi
   systemctl restart nginx.service
   systemctl restart danted.service
@@ -1190,6 +1349,7 @@ EOF
   systemctl restart tproxy-server.service
   if ((ENABLE_IPV6)); then
     systemctl restart mtproxy-ipv6.service
+    systemctl restart teleproxy-ipv6.service
   fi
   systemctl restart teleproxy.service
   systemctl start mtproxy-config-refresh.timer
@@ -1228,14 +1388,14 @@ verify_web_proxy_endpoint() {
   local websocket_headers="${WORK_DIR}/web-proxy-websocket.headers"
 
   bridge_capability="$(web_proxy_capability)"
-  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" \
+  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${PUBLIC_IPV4}" \
     "https://${DOMAIN}/?bridge=${bridge_capability}" -o "${bridge_page}"
   bootstrap_token="$(sed -n 's/.*bootstrap="\([A-Za-z0-9_-]\{43\}\)".*/\1/p' "${bridge_page}" | head -n 1)"
   [[ "${bootstrap_token}" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
     die "Telegram WEB Proxy bridge page did not contain a valid bootstrap token."
 
   printf '100000000000000101' | xxd -r -p >"${hello_frame}"
-  http_code="$(curl -sS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" \
+  http_code="$(curl -sS --max-time 8 --resolve "${DOMAIN}:443:${PUBLIC_IPV4}" \
     -D "${session_headers}" -o "${welcome_frame}" -w '%{http_code}' \
     -H "Authorization: Bearer ${bootstrap_token}" \
     -H 'Content-Type: application/octet-stream' \
@@ -1249,7 +1409,7 @@ verify_web_proxy_endpoint() {
   [[ "${session_token}" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
     die "Telegram WEB Proxy did not return a valid session token."
 
-  curl -sS --http1.1 --max-time 2 --resolve "${DOMAIN}:443:127.0.0.1" \
+  curl -sS --http1.1 --max-time 2 --resolve "${DOMAIN}:443:${PUBLIC_IPV4}" \
     -D "${websocket_headers}" -o /dev/null \
     -H 'Connection: Upgrade' \
     -H 'Upgrade: websocket' \
@@ -1276,6 +1436,7 @@ verify_vless_endpoint() {
   local result=""
   local attempt
 
+  validate_vless_fingerprint "${VLESS_TLS_FINGERPRINT}"
   cat >"${client_config}" <<EOF
 {
   "log": {
@@ -1314,7 +1475,7 @@ verify_vless_endpoint() {
         "tlsSettings": {
           "serverName": "${tls_domain}",
           "allowInsecure": false,
-          "fingerprint": "safari",
+          "fingerprint": "${VLESS_TLS_FINGERPRINT}",
           "alpn": [
             "http/1.1"
           ]
@@ -1375,6 +1536,9 @@ verify_services() {
 
   if ((ENABLE_IPV6)); then
     services+=(mtproxy-ipv6.service)
+    if [[ "${FAKETLS_ENGINE}" == mtg ]]; then
+      services+=(teleproxy-ipv6.service)
+    fi
   fi
 
   log "Verifying services and local endpoints"
@@ -1386,11 +1550,14 @@ verify_services() {
   done
 
   retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8888/stats >/dev/null
+  if ((ENABLE_IPV6)) && [[ "${FAKETLS_ENGINE}" == mtg ]]; then
+    retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8890/stats >/dev/null
+  fi
   retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8889/stats >/dev/null
   retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8081/healthz >/dev/null
   retry 12 1 curl -fsS --max-time 5 http://127.0.0.1:8081/readyz >/dev/null
-  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" >/dev/null
-  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:127.0.0.1" \
+  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${PUBLIC_IPV4}" "https://${DOMAIN}/" >/dev/null
+  retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:443:${PUBLIC_IPV4}" \
     "https://${DOMAIN}/happ/${HAPP_SUBSCRIPTION_ID}.txt" >/dev/null
   retry 12 1 curl -fsS --max-time 8 --resolve "${DOMAIN}:9443:127.0.0.1" \
     "https://${DOMAIN}:9443/happ/${HAPP_SUBSCRIPTION_ID}.txt" >/dev/null
@@ -1409,7 +1576,7 @@ verify_services() {
     "https://api.ipify.org" "${PUBLIC_IPV4}"
 
   if ((ENABLE_IPV6)); then
-    retry 12 1 curl -gfsS --max-time 8 --resolve "${DOMAIN_IPV6}:443:[::1]" \
+    retry 12 1 curl -gfsS --max-time 8 --resolve "${DOMAIN_IPV6}:443:[${PUBLIC_IPV6}]" \
       "https://${DOMAIN_IPV6}/" >/dev/null
     socks_result="$(curl -fsS --connect-timeout 10 --max-time 30 \
       --proxy "socks5h://${SOCKS_USER}:${SOCKS_PASSWORD}@[::1]:1080" \
@@ -1471,6 +1638,7 @@ Ports: 443 (primary), 9443 (reserve)
 UUID: ${VLESS_UUID}
 Transport: WebSocket
 TLS/SNI/Host: ${DOMAIN_IPV6}
+TLS Fingerprint: ${VLESS_TLS_FINGERPRINT}
 Path: ${VLESS_WS_PATH}
 
 VLESS URI (primary):
@@ -1557,6 +1725,7 @@ Ports: 443 (primary), 9443 (reserve)
 UUID: ${VLESS_UUID}
 Transport: WebSocket
 TLS/SNI/Host: ${DOMAIN}
+TLS Fingerprint: ${VLESS_TLS_FINGERPRINT}
 Path: ${VLESS_WS_PATH}
 
 VLESS URI (primary):
@@ -1601,14 +1770,18 @@ ${ipv6_output}
 
 ADMINISTRATION
 Credentials file: ${CREDENTIALS_OUTPUT}
+FakeTLS engine: MTG ${MTG_VERSION} (service name: teleproxy.service)
+FakeTLS config: ${MTG_CONFIG}
+FakeTLS IPv6 config (only when enabled): ${MTG_IPV6_CONFIG}
 Xray config: ${XRAY_CONFIG}
 Telegram WEB Proxy config: ${TPROXY_SERVER_CONFIG}
 Happ subscription file: ${NGINX_ROOT}/happ/${HAPP_SUBSCRIPTION_ID}.txt
-FakeTLS stats: curl http://127.0.0.1:8888/stats
+FakeTLS stats (Prometheus): curl http://127.0.0.1:8888/stats
+FakeTLS IPv6 stats (only when enabled): curl http://127.0.0.1:8890/stats
 Legacy stats: curl http://127.0.0.1:8889/stats
 WEB Proxy health: curl http://127.0.0.1:8081/readyz
 Refresh timer: systemctl list-timers mtproxy-config-refresh.timer
-Logs: journalctl -u teleproxy -u tproxy-server -u mtproxy -u danted -u xray -u nginx --no-pager -n 150
+Logs: journalctl -u teleproxy -u teleproxy-ipv6 -u tproxy-server -u mtproxy -u danted -u xray -u nginx --no-pager -n 150
 
 Security note: ordinary SOCKS5 is authenticated but not itself encrypted.
 EOF
@@ -1644,6 +1817,7 @@ main() {
     [[ "${DOMAIN_IPV6}" != "${DOMAIN}" ]] || die "IPv4 and IPv6 domains must be different."
     ENABLE_IPV6=1
   fi
+  check_existing_domains
 
   WORK_DIR="$(mktemp -d /tmp/proxy-stack.XXXXXX)"
   backup_dir="/root/proxy-stack-backup-$(date +%Y%m%d-%H%M%S)"
@@ -1651,6 +1825,14 @@ main() {
   backup_if_present "/etc/danted.conf" "${backup_dir}"
   backup_if_present "${NGINX_SITE}" "${backup_dir}"
   backup_if_present "/etc/systemd/system/teleproxy.service" "${backup_dir}"
+  backup_if_present "/etc/systemd/system/teleproxy-ipv6.service" "${backup_dir}"
+  backup_if_present "/etc/systemd/system/teleproxy.service.d" "${backup_dir}"
+  backup_if_present "/etc/systemd/system/teleproxy-ipv6.service.d" "${backup_dir}"
+  backup_if_present "${MTPROXY_DIR}" "${backup_dir}"
+  backup_if_present "${STATE_DIR}" "${backup_dir}"
+  backup_if_present "${CREDENTIALS_OUTPUT}" "${backup_dir}"
+  backup_if_present "${MTG_BIN}" "${backup_dir}"
+  backup_if_present "${TELEPROXY_BIN}" "${backup_dir}"
   backup_if_present "/etc/systemd/system/mtproxy.service" "${backup_dir}"
   backup_if_present "/etc/systemd/system/mtproxy-ipv6.service" "${backup_dir}"
   backup_if_present "/etc/systemd/system/tproxy-server.service" "${backup_dir}"
@@ -1663,7 +1845,7 @@ main() {
   check_clean_ports
   check_dns
   load_or_create_credentials
-  install_teleproxy
+  install_mtg "${MTG_BIN}"
   install_official_mtproxy "${MTPROXY_BIN}"
   install_tproxy_server "${TPROXY_SERVER_BIN}"
   install_xray "${XRAY_BIN}"
@@ -1674,7 +1856,7 @@ main() {
   configure_xray
   configure_tproxy_server
   write_happ_subscription
-  install_proxy_services
+  install_proxy_services "${backup_dir}"
   verify_services
 
   printf '%s\n' "domain_ipv4=${DOMAIN}" "public_ipv4=${PUBLIC_IPV4}" \
@@ -1687,5 +1869,7 @@ main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  trap cleanup EXIT
+  trap 'on_error ${LINENO}' ERR
   main "$@"
 fi
